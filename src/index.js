@@ -200,48 +200,21 @@ function rewriteBareImportsForBrowser(code) {
     });
 }
 
-function extractDefaultComponentName(source) {
-  const match = source.match(/export\s+default\s+function\s+([A-Za-z_$][\w$]*)\s*\(/);
-  if (match?.[1]) return match[1];
-
-  const exprMatch = source.match(/export\s+default\s+([A-Za-z_$][\w$]*)\s*;/);
-  if (exprMatch?.[1]) return exprMatch[1];
-
-  return "App";
-}
-
 async function renderReactSourceToHtml({ source, title = "My Website" }) {
-  const rewritten = rewriteBareImportsForBrowser(source);
-  const componentName = extractDefaultComponentName(source);
-
-  const entry = `
-import React from "https://esm.sh/react@18";
-import { createRoot } from "https://esm.sh/react-dom@18/client";
-${rewritten}
-
-const __Component =
-  typeof ${componentName} !== "undefined"
-    ? ${componentName}
-    : (typeof App !== "undefined" ? App : null);
-
-if (!__Component) {
-  throw new Error("Could not locate default React component export.");
-}
-
-const __root = createRoot(document.getElementById("root"));
-__root.render(React.createElement(__Component));
-`;
-
+  const rewrittenInput = rewriteBareImportsForBrowser(source);
   let transpiled;
   try {
-    transpiled = await esbuild.transform(entry, {
+    transpiled = await esbuild.transform(rewrittenInput, {
       loader: "jsx",
       format: "esm",
-      target: "es2020"
+      target: "es2020",
+      jsx: "automatic"
     });
   } catch (error) {
     throw new Error(`React source compilation failed: ${error.message}`);
   }
+  const transpiledModule = rewriteBareImportsForBrowser(transpiled.code);
+  const escapedModule = JSON.stringify(transpiledModule);
 
   return `<!doctype html>
 <html lang="en">
@@ -253,27 +226,33 @@ __root.render(React.createElement(__Component));
 <body>
   <div id="root"></div>
   <script type="module">
-${transpiled.code}
+import React from "https://esm.sh/react@18";
+import { createRoot } from "https://esm.sh/react-dom@18/client";
+
+const __moduleCode = ${escapedModule};
+const __blob = new Blob([__moduleCode], { type: "text/javascript" });
+const __url = URL.createObjectURL(__blob);
+
+try {
+  const __mod = await import(__url);
+  const __component =
+    __mod.default ??
+    __mod.App ??
+    Object.values(__mod).find((v) => typeof v === "function") ??
+    null;
+
+  if (!__component) {
+    throw new Error("No React component export found. Export a default component.");
+  }
+
+  const __root = createRoot(document.getElementById("root"));
+  __root.render(React.createElement(__component));
+} finally {
+  URL.revokeObjectURL(__url);
+}
   </script>
 </body>
 </html>`;
-}
-
-async function resolveWebsiteHtml({ html, website_file }) {
-  if (typeof html === "string" && html.trim()) {
-    return html;
-  }
-
-  if (website_file?.download_url) {
-    const response = await fetch(website_file.download_url);
-    if (!response.ok) {
-      throw new Error(`Failed to download uploaded file (${response.status}).`);
-    }
-    const text = await response.text();
-    return text;
-  }
-
-  throw new Error("Provide html content or an uploaded website_file.");
 }
 
 async function publishWebsiteInternal(website) {
@@ -348,28 +327,14 @@ async function publishWebsiteInternal(website) {
 async function promoteDraftToPublished() {
   const existing = ensureWebsiteShape(getWebsite());
   if (!existing) {
-    throw new Error("No website found. Create one first with create_my_website.");
+    throw new Error("No website draft found. Set JSX first with set_my_site_source.");
   }
 
   let draft = getDraftVersion(existing);
   let draftId = existing.draftVersionId;
 
   if (!draft) {
-    const fallbackVersion = createVersionRecord({
-      sourceMode: "generated",
-      htmlSource: renderWebsiteHtml(existing),
-      title: existing.displayName
-    });
-    const patched = updateWebsite((current) => {
-      const shaped = ensureWebsiteShape(current);
-      return {
-        ...shaped,
-        versions: [...(shaped.versions || []), fallbackVersion],
-        draftVersionId: fallbackVersion.id
-      };
-    });
-    draft = fallbackVersion;
-    draftId = patched.draftVersionId;
+    throw new Error("No website draft found. Set JSX first with set_my_site_source.");
   }
 
   const renderedHtml = await renderVersionToHtml(existing, draft);
@@ -477,113 +442,72 @@ function createMcpServer() {
 
   registerAppTool(
     server,
-    "create_my_website",
+    "set_my_site_source",
     {
-      title: "Create my website",
-      description: "Create your personal website. Each user can have one website.",
+      title: "Set my site source",
+      description: "Save your website source as full React JSX module code.",
       inputSchema: z.object({
-        display_name: z.string().min(2),
-        headline: z.string().optional(),
-        bio: z.string().optional(),
-        sections: z.array(z.string()).optional(),
-        style: z.enum(["classic", "modern", "minimal"]).optional()
-      }),
-      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
-      _meta: {
-        "openai/toolInvocation/invoking": "Creating your website...",
-        "openai/toolInvocation/invoked": "Website created."
-      }
-    },
-    async ({ display_name, headline, bio, sections, style }) => {
-      const existing = getWebsite();
-      if (existing) {
-        return {
-          structuredContent: {
-            status: "already_exists",
-            website_url: existing.websiteUrl,
-            domain: existing.domain ?? null
-          },
-          content: toolText("You already have a website. Use update_my_website to change it.")
-        };
-      }
-
-      const projectName = resolveProjectName(display_name || "website");
-      const website = updateWebsite(() => ({
-        displayName: display_name,
-        headline: headline ?? "",
-        bio: bio ?? "",
-        sections: sections ?? [],
-        style: style ?? "classic",
-        sourceMode: "generated",
-        htmlSource: null,
-        reactSource: null,
-        projectName,
-        latestDeploymentId: null,
-        latestDeploymentUrl: null,
-        websiteUrl: null,
-        domain: null,
-        domainVerified: false,
-        lastPublishedAt: null,
-        status: "created"
-        ,
-        versions: [],
-        draftVersionId: null,
-        publishedVersionId: null
-      }));
-
-      return {
-        structuredContent: {
-          status: "created",
-          project_name: projectName,
-          website_url: website.websiteUrl,
-          source_mode: "generated",
-          has_uploaded_html: false
-        },
-        content: toolText("Your website has been created. Upload or paste HTML with set_website_html, then publish.")
-      };
-    }
-  );
-
-  registerAppTool(
-    server,
-    "set_website_react_source",
-    {
-      title: "Set website React source",
-      description: "Paste React JSX source code for your website component and use it for publishing.",
-      inputSchema: z.object({
-        component_jsx: z.string().min(10).describe("React component source code (.jsx)"),
+        component_jsx: z.string().min(10).describe("Full React module source (.jsx) with a default component export"),
         title: z.string().optional().describe("Optional browser page title override")
       }),
       annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
       _meta: {
-        "openai/toolInvocation/invoking": "Saving React source...",
-        "openai/toolInvocation/invoked": "React source saved."
+        "openai/toolInvocation/invoking": "Saving site source...",
+        "openai/toolInvocation/invoked": "Site source saved."
       }
     },
     async ({ component_jsx, title }) => {
-      const existing = getWebsite();
-      if (!existing) {
-        throw new Error("No website found. Create one first with create_my_website.");
+      if (component_jsx.length > 2_000_000) {
+        throw new Error("React source is too large. Keep it under 2MB.");
       }
 
-      if (component_jsx.length > 700_000) {
-        throw new Error("React source is too large. Keep it under 700KB.");
+      if (/<html[\s>]/i.test(component_jsx) || /<!doctype\s+html/i.test(component_jsx)) {
+        throw new Error("This builder accepts JSX only. Provide a React component module, not raw HTML.");
       }
+
+      const existing = ensureWebsiteShape(getWebsite());
+      const displayName = (title || existing?.displayName || "Website").trim();
+      const projectName = existing?.projectName || resolveProjectName(displayName);
+      const source = component_jsx.trim();
 
       const version = createVersionRecord({
         sourceMode: "react",
-        reactSource: component_jsx,
-        title: title ?? existing.displayName
+        reactSource: source,
+        title: title ?? existing?.displayName ?? "Website"
       });
 
       updateWebsite((current) => {
         const shaped = ensureWebsiteShape(current);
+        if (!shaped) {
+          return {
+            displayName,
+            headline: "",
+            bio: "",
+            sections: [],
+            style: "classic",
+            sourceMode: "react",
+            htmlSource: null,
+            reactSource: source,
+            projectName,
+            latestDeploymentId: null,
+            latestDeploymentUrl: null,
+            websiteUrl: null,
+            domain: null,
+            domainVerified: false,
+            lastPublishedAt: null,
+            status: "react_source_set",
+            versions: [version],
+            draftVersionId: version.id,
+            publishedVersionId: null
+          };
+        }
+
         return {
           ...shaped,
+          displayName,
           sourceMode: "react",
-          reactSource: component_jsx,
+          reactSource: source,
           htmlSource: null,
-          displayName: title ?? shaped.displayName,
           status: "react_source_set",
           versions: [...(shaped.versions || []), version],
           draftVersionId: version.id
@@ -594,144 +518,10 @@ function createMcpServer() {
         structuredContent: {
           status: "saved",
           source_mode: "react",
-          bytes: component_jsx.length,
+          bytes: source.length,
           draft_version_id: version.id
         },
-        content: toolText("React source saved. Say 'publish my website' to compile and deploy it.")
-      };
-    }
-  );
-
-  registerAppTool(
-    server,
-    "set_website_html",
-    {
-      title: "Set website HTML",
-      description: "Upload or paste the HTML you want deployed for your website.",
-      inputSchema: z.object({
-        html: z.string().optional().describe("Raw HTML for the website"),
-        website_file: z
-          .object({
-            download_url: z.string(),
-            file_id: z.string().optional()
-          })
-          .optional()
-          .describe("Uploaded HTML file object")
-      }),
-      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
-      _meta: {
-        "openai/toolInvocation/invoking": "Saving your website HTML...",
-        "openai/toolInvocation/invoked": "Website HTML saved.",
-        "openai/fileParams": ["website_file"]
-      }
-    },
-    async ({ html, website_file }) => {
-      const existing = getWebsite();
-      if (!existing) {
-        throw new Error("No website found. Create one first with create_my_website.");
-      }
-
-      const resolved = await resolveWebsiteHtml({ html, website_file });
-      if (resolved.length > 500_000) {
-        throw new Error("HTML file is too large. Keep it under 500KB.");
-      }
-
-      const version = createVersionRecord({
-        sourceMode: "html",
-        htmlSource: resolved,
-        title: existing.displayName
-      });
-
-      updateWebsite((current) => {
-        const shaped = ensureWebsiteShape(current);
-        return {
-          ...shaped,
-          sourceMode: "html",
-          htmlSource: resolved,
-          reactSource: null,
-          status: "html_set",
-          versions: [...(shaped.versions || []), version],
-          draftVersionId: version.id
-        };
-      });
-
-      return {
-        structuredContent: {
-          status: "saved",
-          bytes: resolved.length,
-          draft_version_id: version.id
-        },
-        content: toolText("Website HTML saved. Say 'publish my website' when ready.")
-      };
-    }
-  );
-
-  registerAppTool(
-    server,
-    "update_my_website",
-    {
-      title: "Update my website",
-      description: "Update your personal website content and publish changes.",
-      inputSchema: z.object({
-        headline: z.string().optional(),
-        bio: z.string().optional(),
-        sections: z.array(z.string()).optional(),
-        style: z.enum(["classic", "modern", "minimal"]).optional(),
-        confirm_update: z.boolean()
-      }),
-      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
-      _meta: {
-        "openai/toolInvocation/invoking": "Updating your website...",
-        "openai/toolInvocation/invoked": "Website updated."
-      }
-    },
-    async ({ headline, bio, sections, style, confirm_update }) => {
-      if (!confirm_update) {
-        return {
-          structuredContent: { requires_confirmation: true },
-          content: toolText("Update not executed. Confirm update to continue.")
-        };
-      }
-
-      const existing = getWebsite();
-      if (!existing) {
-        throw new Error("No website found. Create one first with create_my_website.");
-      }
-
-      const updated = updateWebsite((current) => {
-        const shaped = ensureWebsiteShape(current);
-        const next = {
-          ...shaped,
-          headline: headline ?? shaped.headline,
-          bio: bio ?? shaped.bio,
-          sections: sections ?? shaped.sections,
-          style: style ?? shaped.style,
-          htmlSource: shaped.htmlSource ?? null,
-          status: "updated"
-        };
-        const generatedVersion = createVersionRecord({
-          sourceMode: "generated",
-          htmlSource: renderWebsiteHtml(next),
-          title: next.displayName
-        });
-        return {
-          ...next,
-          versions: [...(shaped.versions || []), generatedVersion],
-          draftVersionId: generatedVersion.id
-        };
-      });
-
-      await publishWebsiteInternal(updated);
-      const current = getWebsite();
-
-      return {
-        structuredContent: {
-          status: "updated",
-          website_url: current.websiteUrl,
-          last_published_at: current.lastPublishedAt,
-          draft_version_id: current.draftVersionId ?? null
-        },
-        content: toolText(`Website updated and published${current.domain ? ` at ${current.domain}` : ""}.`)
+        content: toolText("Site JSX saved. Call publish_my_website to compile and deploy.")
       };
     }
   );
@@ -764,10 +554,9 @@ function createMcpServer() {
           status: published.status,
           website_url: published.latestDeploymentUrl,
           domain_url: published.domain ? `https://${published.domain}` : null,
-          source_mode: published.sourceMode ?? "generated",
+          source_mode: published.sourceMode ?? "react",
           draft_version_id: draftId ?? null,
           published_version_id: published.publishedVersionId ?? null,
-          has_uploaded_html: Boolean(published.htmlSource),
           message: published.domain && !published.domainVerified ? "Domain linked, waiting for DNS propagation." : "Website is published."
         },
         content: toolText(
@@ -812,30 +601,9 @@ function createMcpServer() {
       if (ownerCheck && ownerCheck.userId !== currentUserId()) {
         throw new Error(`${normalized} is already connected to another user website.`);
       }
-      let website = getWebsite();
+      let website = ensureWebsiteShape(getWebsite());
       if (!website) {
-        const projectName = resolveProjectName(contact.name || "website");
-        website = updateWebsite(() => ({
-          displayName: contact.name,
-          headline: "",
-          bio: "",
-          sections: [],
-          style: "classic",
-          sourceMode: "generated",
-          htmlSource: null,
-          reactSource: null,
-          projectName,
-          latestDeploymentId: null,
-          latestDeploymentUrl: null,
-          websiteUrl: null,
-          domain: null,
-          domainVerified: false,
-          lastPublishedAt: null,
-          status: "created",
-          versions: [],
-          draftVersionId: null,
-          publishedVersionId: null
-        }));
+        throw new Error("No website source found. Call set_my_site_source first.");
       }
 
       const existingDomain = await findDomainByName(normalized);
@@ -909,10 +677,10 @@ function createMcpServer() {
       if (!website) {
         return {
           structuredContent: {
-            website_exists: false,
-            message: "No website yet."
+          website_exists: false,
+            message: "No website source yet."
           },
-          content: toolText("You don't have a website yet. Say 'create my website' to get started.")
+          content: toolText("No site source yet. Call set_my_site_source with JSX first.")
         };
       }
 
@@ -932,10 +700,9 @@ function createMcpServer() {
           website_exists: true,
           website_url: website.latestDeploymentUrl,
           domain: website.domain,
-          source_mode: website.sourceMode ?? "generated",
+          source_mode: website.sourceMode ?? "react",
           draft_version_id: website.draftVersionId ?? null,
           published_version_id: website.publishedVersionId ?? null,
-          has_uploaded_html: Boolean(website.htmlSource),
           domain_connected: Boolean(website.domain),
           ssl_ready: Boolean(domainVerified),
           last_published_at: website.lastPublishedAt,

@@ -7,11 +7,8 @@ MCP server for searching and managing `.cv` domains inside ChatGPT using Ola API
 - P1 management tools: `list_domains`, `renew_domain`, `update_dns`
 - Contact tools: `create_contact`, `list_contacts`, `fetch_contact`
 - Combined flow: `register_domain_with_contact` (contact + domain registration in one backend workflow)
-- Simplified website-builder tools:
-  - `create_my_website`
-  - `set_website_react_source`
-  - `set_website_html`
-  - `update_my_website`
+- JSX-only website-builder tools:
+  - `set_my_site_source`
   - `publish_my_website`
   - `set_my_domain`
   - `my_website_status`
@@ -76,8 +73,7 @@ Planned for managed website hosting integration:
 - `renew john.cv`
 - `show my contacts`
 - `register john.cv with this contact ...`
-- `create my website for Opeyemi Awoyemi`
-- `set website react source ...`
+- `set my site source ...`
 - `publish my website`
 - `set my domain to yourname.cv`
 - `what is my website status`
@@ -88,6 +84,8 @@ Planned for managed website hosting integration:
 - Published user content is served per-domain through the MCP backend endpoint:
   - `GET /site-content?domain=<custom-domain>`
 - The deployed Vercel app shell loads domain-specific content by host, so different domains can show different pages on the same project.
+- `set_my_site_source` accepts full React `.jsx` module input (imports + `export default` component) and compiles it for browser runtime.
+- React source upload limit is 2MB.
 
 ## P0 conversation behavior
 Expected interaction:
