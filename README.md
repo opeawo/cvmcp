@@ -61,6 +61,7 @@ Optional now:
 Planned for managed website hosting integration:
 - `VERCEL_TOKEN`
 - `VERCEL_TEAM_ID`
+- `VERCEL_PROJECT_NAME` (recommended: single shared project for all user domains)
 - `VERCEL_PROJECT_PREFIX`
 - `VERCEL_DEFAULT_REGION`
 

@@ -20,6 +20,7 @@ export function loadConfig() {
     defaultRenewalYears: Number.parseInt(process.env.DEFAULT_RENEWAL_YEARS ?? "1", 10),
     vercelToken: process.env.VERCEL_TOKEN ?? "",
     vercelTeamId: process.env.VERCEL_TEAM_ID ?? "",
+    vercelProjectName: process.env.VERCEL_PROJECT_NAME ?? "",
     vercelProjectPrefix: process.env.VERCEL_PROJECT_PREFIX ?? "cvmcp",
     vercelDefaultRegion: process.env.VERCEL_DEFAULT_REGION ?? "iad1",
     stateFilePath: process.env.STATE_FILE_PATH ?? "./data/state.json"

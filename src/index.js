@@ -74,6 +74,10 @@ function ensureVercelConfigured() {
   }
 }
 
+function resolveProjectName(displayName = "website") {
+  return config.vercelProjectName || `${config.vercelProjectPrefix}-${slugify(displayName) || "website"}`;
+}
+
 function domainFromResponse(response) {
   return response?.domain || response?.name || response?.fqdn || response?.data?.domain || null;
 }
@@ -232,8 +236,9 @@ async function resolveWebsiteHtml({ html, website_file }) {
 
 async function publishWebsiteInternal(website) {
   ensureVercelConfigured();
+  const projectName = config.vercelProjectName || website.projectName || resolveProjectName(website.displayName);
 
-  await vercel.createProjectIfMissing(website.projectName, config.vercelDefaultRegion);
+  await vercel.createProjectIfMissing(projectName, config.vercelDefaultRegion);
   let html = renderWebsiteHtml(website);
   if (website?.sourceMode === "html" && website?.htmlSource) {
     html = website.htmlSource;
@@ -243,18 +248,18 @@ async function publishWebsiteInternal(website) {
       title: website.displayName || "My Website"
     });
   }
-  const deployment = await vercel.deployStaticHtml({ projectName: website.projectName, html });
+  const deployment = await vercel.deployStaticHtml({ projectName, html });
 
   let domainStatus = null;
   if (website.domain) {
     try {
-      await vercel.attachDomain(website.projectName, website.domain);
+      await vercel.attachDomain(projectName, website.domain);
     } catch (error) {
       if (!String(error.message).toLowerCase().includes("already")) {
         throw error;
       }
     }
-    domainStatus = await vercel.getDomainStatus(website.projectName, website.domain);
+    domainStatus = await vercel.getDomainStatus(projectName, website.domain);
   }
 
   const deploymentUrl = deployment?.url ? `https://${deployment.url}` : null;
@@ -262,6 +267,7 @@ async function publishWebsiteInternal(website) {
 
   const updated = updateWebsite((current) => ({
     ...current,
+    projectName,
     latestDeploymentId: deployment?.id ?? current?.latestDeploymentId ?? null,
     latestDeploymentUrl: deploymentUrl,
     websiteUrl: liveUrl,
@@ -325,7 +331,7 @@ function createMcpServer() {
         };
       }
 
-      const projectName = `${config.vercelProjectPrefix}-${slugify(display_name || "website") || "website"}`;
+      const projectName = resolveProjectName(display_name || "website");
       const website = updateWebsite(() => ({
         displayName: display_name,
         headline: headline ?? "",
@@ -588,7 +594,7 @@ function createMcpServer() {
       const normalized = normalizeCvDomain(domain);
       let website = getWebsite();
       if (!website) {
-        const projectName = `${config.vercelProjectPrefix}-website`;
+        const projectName = resolveProjectName(contact.name || "website");
         website = updateWebsite(() => ({
           displayName: contact.name,
           headline: "",
