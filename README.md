@@ -82,6 +82,13 @@ Planned for managed website hosting integration:
 - `set my domain to yourname.cv`
 - `what is my website status`
 
+## Shared Project Multi-Domain Mode
+- Set `VERCEL_PROJECT_NAME` to your single shared Vercel project.
+- All custom domains are attached to that one project.
+- Published user content is served per-domain through the MCP backend endpoint:
+  - `GET /site-content?domain=<custom-domain>`
+- The deployed Vercel app shell loads domain-specific content by host, so different domains can show different pages on the same project.
+
 ## P0 conversation behavior
 Expected interaction:
 1. User: `Is john.cv available?`

@@ -74,6 +74,48 @@ function ensureVercelConfigured() {
   }
 }
 
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function createVersionRecord({ sourceMode, htmlSource = null, reactSource = null, title = null }) {
+  return {
+    id: randomUUID(),
+    sourceMode,
+    htmlSource,
+    reactSource,
+    title,
+    createdAt: nowIso()
+  };
+}
+
+function ensureWebsiteShape(website) {
+  if (!website) return null;
+  return {
+    ...website,
+    versions: Array.isArray(website.versions) ? website.versions : [],
+    draftVersionId: website.draftVersionId ?? null,
+    publishedVersionId: website.publishedVersionId ?? null
+  };
+}
+
+function getVersionById(website, versionId) {
+  const w = ensureWebsiteShape(website);
+  return w?.versions?.find((v) => v.id === versionId) ?? null;
+}
+
+function getDraftVersion(website) {
+  const w = ensureWebsiteShape(website);
+  if (!w?.draftVersionId) return null;
+  return getVersionById(w, w.draftVersionId);
+}
+
+function getPublishedVersion(website) {
+  const w = ensureWebsiteShape(website);
+  if (!w?.publishedVersionId) return null;
+  return getVersionById(w, w.publishedVersionId);
+}
+
 function resolveProjectName(displayName = "website") {
   return config.vercelProjectName || `${config.vercelProjectPrefix}-${slugify(displayName) || "website"}`;
 }
@@ -239,16 +281,7 @@ async function publishWebsiteInternal(website) {
   const projectName = config.vercelProjectName || website.projectName || resolveProjectName(website.displayName);
 
   await vercel.createProjectIfMissing(projectName, config.vercelDefaultRegion);
-  let html = renderWebsiteHtml(website);
-  if (website?.sourceMode === "html" && website?.htmlSource) {
-    html = website.htmlSource;
-  } else if (website?.sourceMode === "react" && website?.reactSource) {
-    html = await renderReactSourceToHtml({
-      source: website.reactSource,
-      title: website.displayName || "My Website"
-    });
-  }
-  const deployment = await vercel.deployStaticHtml({ projectName, html });
+  const deployment = await vercel.deployStaticHtml({ projectName, html: routerShellHtml() });
 
   let domainStatus = null;
   if (website.domain) {
@@ -262,7 +295,7 @@ async function publishWebsiteInternal(website) {
     domainStatus = await vercel.getDomainStatus(projectName, website.domain);
   }
 
-  const deploymentUrl = deployment?.url ? `https://${deployment.url}` : null;
+  const deploymentUrl = deployment?.url ? `https://${deployment.url}` : `https://${projectName}.vercel.app`;
   const liveUrl = website.domain ? `https://${website.domain}` : deploymentUrl;
 
   const updated = updateWebsite((current) => ({
@@ -277,6 +310,69 @@ async function publishWebsiteInternal(website) {
   }));
 
   return { website: updated, deployment, domainStatus };
+}
+
+async function renderVersionToHtml(website, version) {
+  if (!version) {
+    return renderWebsiteHtml(website);
+  }
+
+  if (version.sourceMode === "html") {
+    return version.htmlSource;
+  }
+
+  if (version.sourceMode === "react") {
+    return renderReactSourceToHtml({
+      source: version.reactSource,
+      title: version.title || website.displayName || "My Website"
+    });
+  }
+
+  if (version.sourceMode === "generated") {
+    return version.htmlSource || renderWebsiteHtml(website);
+  }
+
+  return renderWebsiteHtml(website);
+}
+
+function routerShellHtml() {
+  const apiBase = process.env.PUBLIC_API_BASE_URL || "https://dotcvmcp.up.railway.app";
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Website</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; }
+    #appFrame { border: 0; width: 100vw; height: 100vh; display: block; }
+    #fallback { font-family: Arial, sans-serif; padding: 24px; }
+  </style>
+</head>
+<body>
+  <iframe id="appFrame" title="website"></iframe>
+  <div id="fallback" style="display:none">No published content found for this domain yet.</div>
+  <script>
+    (async () => {
+      const host = window.location.hostname;
+      const res = await fetch("${apiBase}/site-content?domain=" + encodeURIComponent(host));
+      if (!res.ok) {
+        document.getElementById("appFrame").style.display = "none";
+        document.getElementById("fallback").style.display = "block";
+        return;
+      }
+      const payload = await res.json();
+      if (!payload || !payload.html) {
+        document.getElementById("appFrame").style.display = "none";
+        document.getElementById("fallback").style.display = "block";
+        return;
+      }
+      const iframe = document.getElementById("appFrame");
+      iframe.srcdoc = payload.html;
+    })();
+  </script>
+</body>
+</html>`;
 }
 
 const contactSchema = z.object({
@@ -349,6 +445,10 @@ function createMcpServer() {
         domainVerified: false,
         lastPublishedAt: null,
         status: "created"
+        ,
+        versions: [],
+        draftVersionId: null,
+        publishedVersionId: null
       }));
 
       return {
@@ -390,20 +490,32 @@ function createMcpServer() {
         throw new Error("React source is too large. Keep it under 700KB.");
       }
 
-      updateWebsite((current) => ({
-        ...current,
+      const version = createVersionRecord({
         sourceMode: "react",
         reactSource: component_jsx,
-        htmlSource: null,
-        displayName: title ?? current.displayName,
-        status: "react_source_set"
-      }));
+        title: title ?? existing.displayName
+      });
+
+      updateWebsite((current) => {
+        const shaped = ensureWebsiteShape(current);
+        return {
+          ...shaped,
+          sourceMode: "react",
+          reactSource: component_jsx,
+          htmlSource: null,
+          displayName: title ?? shaped.displayName,
+          status: "react_source_set",
+          versions: [...(shaped.versions || []), version],
+          draftVersionId: version.id
+        };
+      });
 
       return {
         structuredContent: {
           status: "saved",
           source_mode: "react",
-          bytes: component_jsx.length
+          bytes: component_jsx.length,
+          draft_version_id: version.id
         },
         content: toolText("React source saved. Say 'publish my website' to compile and deploy it.")
       };
@@ -444,18 +556,30 @@ function createMcpServer() {
         throw new Error("HTML file is too large. Keep it under 500KB.");
       }
 
-      updateWebsite((current) => ({
-        ...current,
+      const version = createVersionRecord({
         sourceMode: "html",
         htmlSource: resolved,
-        reactSource: null,
-        status: "html_set"
-      }));
+        title: existing.displayName
+      });
+
+      updateWebsite((current) => {
+        const shaped = ensureWebsiteShape(current);
+        return {
+          ...shaped,
+          sourceMode: "html",
+          htmlSource: resolved,
+          reactSource: null,
+          status: "html_set",
+          versions: [...(shaped.versions || []), version],
+          draftVersionId: version.id
+        };
+      });
 
       return {
         structuredContent: {
           status: "saved",
-          bytes: resolved.length
+          bytes: resolved.length,
+          draft_version_id: version.id
         },
         content: toolText("Website HTML saved. Say 'publish my website' when ready.")
       };
@@ -494,15 +618,28 @@ function createMcpServer() {
         throw new Error("No website found. Create one first with create_my_website.");
       }
 
-      const updated = updateWebsite((current) => ({
-        ...current,
-        headline: headline ?? current.headline,
-        bio: bio ?? current.bio,
-        sections: sections ?? current.sections,
-        style: style ?? current.style,
-        htmlSource: current.htmlSource ?? null,
-        status: "updated"
-      }));
+      const updated = updateWebsite((current) => {
+        const shaped = ensureWebsiteShape(current);
+        const next = {
+          ...shaped,
+          headline: headline ?? shaped.headline,
+          bio: bio ?? shaped.bio,
+          sections: sections ?? shaped.sections,
+          style: style ?? shaped.style,
+          htmlSource: shaped.htmlSource ?? null,
+          status: "updated"
+        };
+        const generatedVersion = createVersionRecord({
+          sourceMode: "generated",
+          htmlSource: renderWebsiteHtml(next),
+          title: next.displayName
+        });
+        return {
+          ...next,
+          versions: [...(shaped.versions || []), generatedVersion],
+          draftVersionId: generatedVersion.id
+        };
+      });
 
       await publishWebsiteInternal(updated);
       const current = getWebsite();
@@ -511,7 +648,8 @@ function createMcpServer() {
         structuredContent: {
           status: "updated",
           website_url: current.websiteUrl,
-          last_published_at: current.lastPublishedAt
+          last_published_at: current.lastPublishedAt,
+          draft_version_id: current.draftVersionId ?? null
         },
         content: toolText(`Website updated and published${current.domain ? ` at ${current.domain}` : ""}.`)
       };
@@ -539,27 +677,66 @@ function createMcpServer() {
         };
       }
 
-      const existing = getWebsite();
+      const existing = ensureWebsiteShape(getWebsite());
       if (!existing) {
         throw new Error("No website found. Create one first with create_my_website.");
       }
 
-      const { website } = await publishWebsiteInternal(existing);
+      let draft = getDraftVersion(existing);
+      let draftId = existing.draftVersionId;
+
+      if (!draft) {
+        const fallbackVersion = createVersionRecord({
+          sourceMode: "generated",
+          htmlSource: renderWebsiteHtml(existing),
+          title: existing.displayName
+        });
+        const patched = updateWebsite((current) => {
+          const shaped = ensureWebsiteShape(current);
+          return {
+            ...shaped,
+            versions: [...(shaped.versions || []), fallbackVersion],
+            draftVersionId: fallbackVersion.id
+          };
+        });
+        draft = fallbackVersion;
+        draftId = patched.draftVersionId;
+      }
+
+      const renderedHtml = await renderVersionToHtml(existing, draft);
+      await publishWebsiteInternal(existing);
+      const published = updateWebsite((current) => {
+        const shaped = ensureWebsiteShape(current);
+        return {
+          ...shaped,
+          sourceMode: draft.sourceMode,
+          htmlSource: draft.sourceMode === "html" ? draft.htmlSource : null,
+          reactSource: draft.sourceMode === "react" ? draft.reactSource : null,
+          publishedVersionId: draftId,
+          versions: (shaped.versions || []).map((v) =>
+            v.id === draftId
+              ? { ...v, renderedHtml, publishedAt: nowIso() }
+              : v
+          )
+        };
+      });
       return {
         structuredContent: {
-          status: website.status,
-          website_url: website.latestDeploymentUrl,
-          domain_url: website.domain ? `https://${website.domain}` : null,
-          source_mode: website.sourceMode ?? "generated",
-          has_uploaded_html: Boolean(website.htmlSource),
-          message: website.domain && !website.domainVerified ? "Domain linked, waiting for DNS propagation." : "Website is published."
+          status: published.status,
+          website_url: published.latestDeploymentUrl,
+          domain_url: published.domain ? `https://${published.domain}` : null,
+          source_mode: published.sourceMode ?? "generated",
+          draft_version_id: published.draftVersionId ?? null,
+          published_version_id: published.publishedVersionId ?? null,
+          has_uploaded_html: Boolean(published.htmlSource),
+          message: published.domain && !published.domainVerified ? "Domain linked, waiting for DNS propagation." : "Website is published."
         },
         content: toolText(
-          website.domain
-            ? website.domainVerified
-              ? `Your website is live at https://${website.domain}.`
-              : `Website published. Domain ${website.domain} is linked and waiting for DNS propagation.`
-            : `Your website is live at ${website.latestDeploymentUrl}.`
+          published.domain
+            ? published.domainVerified
+              ? `Your website is live at https://${published.domain}.`
+              : `Website published. Domain ${published.domain} is linked and waiting for DNS propagation.`
+            : `Your website is live at ${published.latestDeploymentUrl}.`
         )
       };
     }
@@ -592,6 +769,10 @@ function createMcpServer() {
 
       ensureVercelConfigured();
       const normalized = normalizeCvDomain(domain);
+      const ownerCheck = state.findWebsiteByDomain(normalized);
+      if (ownerCheck && ownerCheck.userId !== currentUserId()) {
+        throw new Error(`${normalized} is already connected to another user website.`);
+      }
       let website = getWebsite();
       if (!website) {
         const projectName = resolveProjectName(contact.name || "website");
@@ -611,7 +792,10 @@ function createMcpServer() {
           domain: null,
           domainVerified: false,
           lastPublishedAt: null,
-          status: "created"
+          status: "created",
+          versions: [],
+          draftVersionId: null,
+          publishedVersionId: null
         }));
       }
 
@@ -681,7 +865,7 @@ function createMcpServer() {
       }
     },
     async () => {
-      const website = getWebsite();
+      const website = ensureWebsiteShape(getWebsite());
       if (!website) {
         return {
           structuredContent: {
@@ -709,6 +893,8 @@ function createMcpServer() {
           website_url: website.latestDeploymentUrl,
           domain: website.domain,
           source_mode: website.sourceMode ?? "generated",
+          draft_version_id: website.draftVersionId ?? null,
+          published_version_id: website.publishedVersionId ?? null,
           has_uploaded_html: Boolean(website.htmlSource),
           domain_connected: Boolean(website.domain),
           ssl_ready: Boolean(domainVerified),
@@ -970,6 +1156,45 @@ app.delete("/mcp", async (req, res) => {
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "olacv-domains", version: "0.2.0" });
+});
+
+app.get("/site-content", async (req, res) => {
+  const requestedDomain = String(
+    req.query.domain || req.header("x-forwarded-host") || req.header("host") || ""
+  )
+    .toLowerCase()
+    .split(":")[0]
+    .trim();
+
+  if (!requestedDomain) {
+    res.status(400).json({ error: "Missing domain query parameter." });
+    return;
+  }
+
+  const found = state.findWebsiteByDomain(requestedDomain);
+  if (!found?.website) {
+    res.status(404).json({ error: "No website mapped for this domain." });
+    return;
+  }
+
+  const website = ensureWebsiteShape(found.website);
+  const publishedVersion = getPublishedVersion(website);
+  if (!publishedVersion) {
+    res.status(404).json({ error: "No published version for this domain yet." });
+    return;
+  }
+
+  const html =
+    publishedVersion.renderedHtml ||
+    (await renderVersionToHtml(website, publishedVersion));
+
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.json({
+    domain: requestedDomain,
+    source_mode: publishedVersion.sourceMode,
+    version_id: publishedVersion.id,
+    html
+  });
 });
 
 app.listen(config.port, () => {

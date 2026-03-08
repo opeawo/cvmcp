@@ -50,4 +50,16 @@ export class StateStore {
     this.write(state);
     return state.users[userId];
   }
+
+  findWebsiteByDomain(domain) {
+    const normalized = String(domain ?? "").toLowerCase();
+    const state = this.read();
+    for (const [userId, user] of Object.entries(state.users ?? {})) {
+      const website = user?.website;
+      if (website?.domain && String(website.domain).toLowerCase() === normalized) {
+        return { userId, website };
+      }
+    }
+    return null;
+  }
 }
