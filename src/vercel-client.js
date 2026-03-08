@@ -60,8 +60,7 @@ export class VercelClient {
         method: "POST",
         body: {
           name: projectName,
-          serverlessFunctionRegion: region,
-          nodeVersion: "24.x"
+          serverlessFunctionRegion: region
         }
       });
     } catch (error) {
