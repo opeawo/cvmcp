@@ -60,11 +60,8 @@ export class VercelClient {
         method: "POST",
         body: {
           name: projectName,
-          defaultResourceConfig: {
-            functionDefaultRegions: [region],
-            fluid: true,
-            elasticConcurrencyEnabled: true
-          }
+          serverlessFunctionRegion: region,
+          nodeVersion: "24.x"
         }
       });
     } catch (error) {
