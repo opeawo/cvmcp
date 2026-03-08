@@ -287,43 +287,44 @@ async function publishWebsiteInternal(website) {
   if (website.domain) {
     const domain = website.domain;
     try {
-      await vercel.attachDomain(projectName, domain);
-    } catch (error) {
-      const msg = String(error.message).toLowerCase();
-      const transferable =
-        msg.includes("already") ||
-        msg.includes("in use") ||
-        msg.includes("another project") ||
-        msg.includes("assigned");
-
-      if (!transferable) {
-        throw error;
-      }
-
-      const projects = await vercel.listProjects();
-      for (const p of projects) {
-        if (!p?.name || p.name === projectName) continue;
-        try {
-          const domains = await vercel.listProjectDomains(p.name);
-          if (domains.some((d) => String(d?.name).toLowerCase() === String(domain).toLowerCase())) {
-            await vercel.removeDomain(p.name, domain);
-          }
-        } catch {
-          // Ignore unrelated project/domain errors during transfer scan.
-        }
-      }
-
-      await vercel.attachDomain(projectName, domain);
-    }
-
-    try {
       domainStatus = await vercel.getDomainStatus(projectName, domain);
     } catch (error) {
-      const msg = String(error.message).toLowerCase();
-      if (!msg.includes("not found")) {
+      const notFound = String(error.message).toLowerCase().includes("not found");
+      if (!notFound) {
         throw error;
       }
-      domainStatus = { verified: false };
+
+      try {
+        await vercel.attachDomain(projectName, domain);
+      } catch (attachError) {
+        const msg = String(attachError.message).toLowerCase();
+        const transferable =
+          msg.includes("already") ||
+          msg.includes("in use") ||
+          msg.includes("another project") ||
+          msg.includes("assigned");
+
+        if (!transferable) {
+          throw attachError;
+        }
+
+        const projects = await vercel.listProjects();
+        for (const p of projects) {
+          if (!p?.name || p.name === projectName) continue;
+          try {
+            const domains = await vercel.listProjectDomains(p.name);
+            if (domains.some((d) => String(d?.name).toLowerCase() === String(domain).toLowerCase())) {
+              await vercel.removeDomain(p.name, domain);
+            }
+          } catch {
+            // Ignore unrelated project/domain errors during transfer scan.
+          }
+        }
+
+        await vercel.attachDomain(projectName, domain);
+      }
+
+      domainStatus = await vercel.getDomainStatus(projectName, domain);
     }
   }
 
@@ -342,6 +343,53 @@ async function publishWebsiteInternal(website) {
   }));
 
   return { website: updated, deployment, domainStatus };
+}
+
+async function promoteDraftToPublished() {
+  const existing = ensureWebsiteShape(getWebsite());
+  if (!existing) {
+    throw new Error("No website found. Create one first with create_my_website.");
+  }
+
+  let draft = getDraftVersion(existing);
+  let draftId = existing.draftVersionId;
+
+  if (!draft) {
+    const fallbackVersion = createVersionRecord({
+      sourceMode: "generated",
+      htmlSource: renderWebsiteHtml(existing),
+      title: existing.displayName
+    });
+    const patched = updateWebsite((current) => {
+      const shaped = ensureWebsiteShape(current);
+      return {
+        ...shaped,
+        versions: [...(shaped.versions || []), fallbackVersion],
+        draftVersionId: fallbackVersion.id
+      };
+    });
+    draft = fallbackVersion;
+    draftId = patched.draftVersionId;
+  }
+
+  const renderedHtml = await renderVersionToHtml(existing, draft);
+  const published = updateWebsite((current) => {
+    const shaped = ensureWebsiteShape(current);
+    return {
+      ...shaped,
+      sourceMode: draft.sourceMode,
+      htmlSource: draft.sourceMode === "html" ? draft.htmlSource : null,
+      reactSource: draft.sourceMode === "react" ? draft.reactSource : null,
+      publishedVersionId: draftId,
+      versions: (shaped.versions || []).map((v) =>
+        v.id === draftId
+          ? { ...v, renderedHtml, publishedAt: nowIso() }
+          : v
+      )
+    };
+  });
+
+  return { published, draftId };
 }
 
 async function renderVersionToHtml(website, version) {
@@ -709,56 +757,15 @@ function createMcpServer() {
         };
       }
 
-      const existing = ensureWebsiteShape(getWebsite());
-      if (!existing) {
-        throw new Error("No website found. Create one first with create_my_website.");
-      }
-
-      let draft = getDraftVersion(existing);
-      let draftId = existing.draftVersionId;
-
-      if (!draft) {
-        const fallbackVersion = createVersionRecord({
-          sourceMode: "generated",
-          htmlSource: renderWebsiteHtml(existing),
-          title: existing.displayName
-        });
-        const patched = updateWebsite((current) => {
-          const shaped = ensureWebsiteShape(current);
-          return {
-            ...shaped,
-            versions: [...(shaped.versions || []), fallbackVersion],
-            draftVersionId: fallbackVersion.id
-          };
-        });
-        draft = fallbackVersion;
-        draftId = patched.draftVersionId;
-      }
-
-      const renderedHtml = await renderVersionToHtml(existing, draft);
-      await publishWebsiteInternal(existing);
-      const published = updateWebsite((current) => {
-        const shaped = ensureWebsiteShape(current);
-        return {
-          ...shaped,
-          sourceMode: draft.sourceMode,
-          htmlSource: draft.sourceMode === "html" ? draft.htmlSource : null,
-          reactSource: draft.sourceMode === "react" ? draft.reactSource : null,
-          publishedVersionId: draftId,
-          versions: (shaped.versions || []).map((v) =>
-            v.id === draftId
-              ? { ...v, renderedHtml, publishedAt: nowIso() }
-              : v
-          )
-        };
-      });
+      const { published: promoted, draftId } = await promoteDraftToPublished();
+      const { website: published } = await publishWebsiteInternal(promoted);
       return {
         structuredContent: {
           status: published.status,
           website_url: published.latestDeploymentUrl,
           domain_url: published.domain ? `https://${published.domain}` : null,
           source_mode: published.sourceMode ?? "generated",
-          draft_version_id: published.draftVersionId ?? null,
+          draft_version_id: draftId ?? null,
           published_version_id: published.publishedVersionId ?? null,
           has_uploaded_html: Boolean(published.htmlSource),
           message: published.domain && !published.domainVerified ? "Domain linked, waiting for DNS propagation." : "Website is published."
@@ -863,7 +870,8 @@ function createMcpServer() {
         status: "domain_set"
       }));
 
-      const { website: published, domainStatus } = await publishWebsiteInternal(website);
+      const { published: promoted } = await promoteDraftToPublished();
+      const { website: published, domainStatus } = await publishWebsiteInternal(promoted);
       const connected = Boolean(domainStatus?.verified);
 
       return {
