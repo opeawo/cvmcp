@@ -35,6 +35,27 @@ function availabilityFromResponse(response, domain) {
   return Boolean(available);
 }
 
+const contactSchema = z.object({
+  name: z.string().min(1).describe("Contact full name"),
+  email: z.string().email().describe("Contact email address"),
+  phone: z.string().min(3).describe("Contact phone number"),
+  fax: z.string().optional().describe("Optional contact fax number"),
+  organization: z.string().optional().describe("Optional contact organization"),
+  address: z.string().min(1).describe("Street or physical address"),
+  city: z.string().min(1).describe("City"),
+  state: z.string().optional().describe("Optional state or province"),
+  postcode: z.string().min(1).describe("Postal code"),
+  country: z
+    .string()
+    .length(2)
+    .regex(/^[A-Za-z]{2}$/)
+    .describe("2-letter ISO country code like US, GB, NG")
+});
+
+function contactFromResponse(response) {
+  return response?.data ?? response?.contact ?? response ?? null;
+}
+
 function createMcpServer() {
   const server = new McpServer({
     name: "olacv-domains",
@@ -151,11 +172,136 @@ function createMcpServer() {
 
   registerAppTool(
     server,
+    "register_domain_with_contact",
+    {
+      title: "Register .cv domain with contact workflow",
+      description:
+        "Use this for end-to-end registration: fetch existing contact or create contact, then register domain after explicit user confirmation.",
+      inputSchema: z.object({
+        domain: z.string().describe("Domain to register, with or without .cv"),
+        years: z
+          .number()
+          .int()
+          .min(1)
+          .max(10)
+          .optional()
+          .describe("Registration period in years. Defaults to 1 year."),
+        auto_renew: z.boolean().optional().describe("Enable auto-renew on the domain"),
+        existing_contact_id: z
+          .string()
+          .optional()
+          .describe("Use this existing contact id instead of creating a new contact"),
+        contact: contactSchema
+          .optional()
+          .describe("New contact to create when existing_contact_id is not provided"),
+        confirm_purchase: z
+          .boolean()
+          .describe("Must be true only after user confirms purchase in the current turn")
+      }),
+      annotations: {
+        readOnlyHint: false,
+        openWorldHint: false,
+        destructiveHint: false
+      },
+      _meta: {
+        "openai/toolInvocation/invoking": "Creating/fetching contact and registering domain...",
+        "openai/toolInvocation/invoked": "Domain registration workflow complete."
+      }
+    },
+    async ({ domain, years, auto_renew, existing_contact_id, contact, confirm_purchase }) => {
+      const normalized = normalizeCvDomain(domain);
+
+      if (!confirm_purchase) {
+        return {
+          structuredContent: {
+            requires_confirmation: true,
+            action: "register_with_contact",
+            domain: normalized
+          },
+          content: toolText(
+            `Registration not executed. Ask: \"Register ${normalized}?\" and call again with confirm_purchase=true.`
+          )
+        };
+      }
+
+      let selectedContactId = existing_contact_id ?? null;
+      let selectedContact = null;
+
+      if (selectedContactId) {
+        const fetched = await ola.fetchContact(selectedContactId);
+        selectedContact = contactFromResponse(fetched);
+      } else if (contact) {
+        const created = await ola.createContact({
+          ...contact,
+          country: contact.country.toUpperCase()
+        });
+        selectedContact = contactFromResponse(created);
+        selectedContactId = selectedContact?.id ?? null;
+      } else {
+        const contactsResult = await ola.listContacts({ perPage: 5, page: 1 });
+        const contacts = Array.isArray(contactsResult?.data) ? contactsResult.data : [];
+
+        if (contacts.length === 1) {
+          selectedContact = contacts[0];
+          selectedContactId = contacts[0].id;
+        } else if (contacts.length > 1) {
+          return {
+            structuredContent: {
+              requires_contact_selection: true,
+              domain: normalized,
+              contacts
+            },
+            content: toolText(
+              "Multiple contacts found. Provide existing_contact_id or pass a contact payload for creation."
+            )
+          };
+        } else {
+          return {
+            structuredContent: {
+              requires_contact_creation: true,
+              domain: normalized
+            },
+            content: toolText(
+              "No contacts found. Provide contact fields so I can create one and register the domain."
+            )
+          };
+        }
+      }
+
+      if (!selectedContactId) {
+        throw new Error("Could not resolve contact id for domain registration.");
+      }
+
+      const result = await ola.registerDomain({
+        domain: normalized,
+        years: years ?? config.defaultRegistrationYears,
+        registrantContactId: selectedContactId,
+        autoRenew: auto_renew ?? false
+      });
+
+      return {
+        structuredContent: {
+          domain: domainFromResponse(result) ?? normalized,
+          status: "registered",
+          contact_id: selectedContactId,
+          contact: selectedContact,
+          raw: result
+        },
+        content: toolText(`Successfully registered ${normalized} with contact ${selectedContactId}.`)
+      };
+    }
+  );
+
+  registerAppTool(
+    server,
     "list_domains",
     {
       title: "List my .cv domains",
       description: "Use this when the user asks to show, list, or manage their domains.",
-      inputSchema: z.object({}),
+      inputSchema: z.object({
+        per_page: z.number().int().min(1).max(100).optional().describe("Records per page"),
+        page: z.number().int().min(1).optional().describe("Page number")
+      }),
       annotations: {
         readOnlyHint: true,
         openWorldHint: false,
@@ -166,8 +312,8 @@ function createMcpServer() {
         "openai/toolInvocation/invoked": "Domain list ready."
       }
     },
-    async () => {
-      const result = await ola.listDomains();
+    async ({ per_page, page }) => {
+      const result = await ola.listDomains({ perPage: per_page, page });
       const domains = Array.isArray(result?.domains)
         ? result.domains
         : Array.isArray(result)
@@ -180,9 +326,111 @@ function createMcpServer() {
         structuredContent: {
           count: domains.length,
           domains,
+          meta: result?.meta ?? null,
           raw: result
         },
         content: toolText(domains.length ? `Found ${domains.length} domain(s).` : "No domains found for this account.")
+      };
+    }
+  );
+
+  registerAppTool(
+    server,
+    "create_contact",
+    {
+      title: "Create contact",
+      description: "Create a new Ola contact. Use this before domain registration when no contact exists.",
+      inputSchema: contactSchema,
+      annotations: {
+        readOnlyHint: false,
+        openWorldHint: false,
+        destructiveHint: false
+      },
+      _meta: {
+        "openai/toolInvocation/invoking": "Creating contact...",
+        "openai/toolInvocation/invoked": "Contact created."
+      }
+    },
+    async (input) => {
+      const result = await ola.createContact({
+        ...input,
+        country: input.country.toUpperCase()
+      });
+      const contact = contactFromResponse(result);
+      return {
+        structuredContent: {
+          contact,
+          raw: result
+        },
+        content: toolText(`Contact created successfully with id ${contact?.id ?? "unknown"}.`)
+      };
+    }
+  );
+
+  registerAppTool(
+    server,
+    "list_contacts",
+    {
+      title: "List contacts",
+      description: "Get contacts in your Ola account.",
+      inputSchema: z.object({
+        per_page: z.number().int().min(1).max(100).optional().describe("Records per page"),
+        page: z.number().int().min(1).optional().describe("Page number")
+      }),
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false,
+        destructiveHint: false
+      },
+      _meta: {
+        "openai/toolInvocation/invoking": "Loading contacts...",
+        "openai/toolInvocation/invoked": "Contacts loaded."
+      }
+    },
+    async ({ per_page, page }) => {
+      const result = await ola.listContacts({ perPage: per_page, page });
+      const contacts = Array.isArray(result?.data) ? result.data : [];
+
+      return {
+        structuredContent: {
+          count: contacts.length,
+          contacts,
+          meta: result?.meta ?? null,
+          raw: result
+        },
+        content: toolText(contacts.length ? `Found ${contacts.length} contact(s).` : "No contacts found.")
+      };
+    }
+  );
+
+  registerAppTool(
+    server,
+    "fetch_contact",
+    {
+      title: "Fetch contact",
+      description: "Get details for one contact by id.",
+      inputSchema: z.object({
+        id: z.string().describe("Contact id")
+      }),
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false,
+        destructiveHint: false
+      },
+      _meta: {
+        "openai/toolInvocation/invoking": "Fetching contact...",
+        "openai/toolInvocation/invoked": "Contact loaded."
+      }
+    },
+    async ({ id }) => {
+      const result = await ola.fetchContact(id);
+      const contact = contactFromResponse(result);
+      return {
+        structuredContent: {
+          contact,
+          raw: result
+        },
+        content: toolText(`Fetched contact ${contact?.id ?? id}.`)
       };
     }
   );

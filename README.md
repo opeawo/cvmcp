@@ -5,6 +5,8 @@ MCP server for searching and managing `.cv` domains inside ChatGPT using Ola API
 ## Implemented scope
 - P0 flow: `check_domain` -> `register_domain`
 - P1 management tools: `list_domains`, `renew_domain`, `update_dns`
+- Contact tools: `create_contact`, `list_contacts`, `fetch_contact`
+- Combined flow: `register_domain_with_contact` (contact + domain registration in one backend workflow)
 
 ## API assumptions
 Using Ola endpoints from your PRD:
@@ -46,6 +48,8 @@ Server endpoints:
 - `register john.cv`
 - `show my domains`
 - `renew john.cv`
+- `show my contacts`
+- `register john.cv with this contact ...`
 
 ## P0 conversation behavior
 Expected interaction:

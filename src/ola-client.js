@@ -61,8 +61,12 @@ export class OlaClient {
     });
   }
 
-  async listDomains() {
-    return this.request("/api/v1/domains", { method: "GET" });
+  async listDomains({ perPage, page } = {}) {
+    const query = new URLSearchParams();
+    if (perPage) query.set("per_page", String(perPage));
+    if (page) query.set("page", String(page));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return this.request(`/api/v1/domains${suffix}`, { method: "GET" });
   }
 
   async renewDomain({ domain, years }) {
@@ -79,5 +83,28 @@ export class OlaClient {
         nameservers
       }
     });
+  }
+
+  async createContact(contact) {
+    return this.request("/api/v1/contacts", {
+      method: "POST",
+      body: contact
+    });
+  }
+
+  async listContacts({ perPage, page } = {}) {
+    const query = new URLSearchParams();
+    if (perPage) query.set("per_page", String(perPage));
+    if (page) query.set("page", String(page));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return this.request(`/api/v1/contacts${suffix}`, { method: "GET" });
+  }
+
+  async fetchContact(contactId) {
+    return this.request(`/api/v1/contacts/${encodeURIComponent(contactId)}`, { method: "GET" });
+  }
+
+  async deleteContact(contactId) {
+    return this.request(`/api/v1/contacts/${encodeURIComponent(contactId)}`, { method: "DELETE" });
   }
 }
