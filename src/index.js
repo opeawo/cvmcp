@@ -6,6 +6,8 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { loadConfig, normalizeCvDomain } from "./config.js";
 import { OlaClient } from "./ola-client.js";
+import { VercelClient } from "./vercel-client.js";
+import { StateStore } from "./state-store.js";
 
 const config = loadConfig();
 const ola = new OlaClient({
@@ -13,9 +15,41 @@ const ola = new OlaClient({
   apiToken: config.olaApiToken,
   authPrefix: config.olaAuthPrefix
 });
+const vercel = config.vercelToken
+  ? new VercelClient({ token: config.vercelToken, teamId: config.vercelTeamId })
+  : null;
+const state = new StateStore(config.stateFilePath);
+
+const USER_ID = "default";
+const INTERNAL_VISIBILITY = { ui: { visibility: ["app"] } };
 
 function toolText(text) {
   return [{ type: "text", text }];
+}
+
+function slugify(input) {
+  return String(input ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32);
+}
+
+function getWebsite() {
+  return state.getUser(USER_ID).website;
+}
+
+function updateWebsite(updater) {
+  return state.updateUser(USER_ID, (user) => {
+    user.website = updater(user.website);
+    return user;
+  }).website;
+}
+
+function ensureVercelConfigured() {
+  if (!vercel) {
+    throw new Error("Managed hosting is not configured yet. Missing VERCEL_TOKEN.");
+  }
 }
 
 function domainFromResponse(response) {
@@ -23,16 +57,98 @@ function domainFromResponse(response) {
 }
 
 function availabilityFromResponse(response, domain) {
-  const domainKey = String(domain ?? "").toLowerCase();
+  const key = String(domain ?? "").toLowerCase();
   const available =
     response?.available ??
     response?.is_available ??
     response?.data?.available ??
-    response?.data?.[domainKey]?.available ??
+    response?.data?.[key]?.available ??
     response?.result?.available ??
     false;
 
   return Boolean(available);
+}
+
+function contactFromResponse(response) {
+  return response?.data ?? response ?? null;
+}
+
+async function findDomainByName(domainName) {
+  const normalized = String(domainName).toLowerCase();
+  const result = await ola.listDomains({ perPage: 100, page: 1 });
+  const domains = Array.isArray(result?.data) ? result.data : [];
+  return domains.find((d) => String(d?.domain ?? "").toLowerCase() === normalized) ?? null;
+}
+
+function renderWebsiteHtml(website) {
+  const sections = Array.isArray(website?.sections) ? website.sections : [];
+  const sectionHtml = sections
+    .map((s) => `<li>${String(s).replace(/</g, "&lt;")}</li>`)
+    .join("\n");
+  const headline = website?.headline ? `<h2>${website.headline}</h2>` : "";
+  const bio = website?.bio ? `<p>${website.bio}</p>` : "";
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>${website.displayName}</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; background: #f8fafc; color: #0f172a; }
+    .wrap { max-width: 860px; margin: 0 auto; padding: 32px 20px 60px; }
+    h1 { margin: 0; font-size: 2.2rem; }
+    h2 { margin: 4px 0 18px; color: #334155; font-size: 1.1rem; }
+    .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px; margin-top: 18px; }
+    ul { line-height: 1.7; }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <h1>${website.displayName}</h1>
+    ${headline}
+    <section class="card">
+      ${bio}
+      ${sectionHtml ? `<ul>${sectionHtml}</ul>` : ""}
+    </section>
+  </main>
+</body>
+</html>`;
+}
+
+async function publishWebsiteInternal(website) {
+  ensureVercelConfigured();
+
+  await vercel.createProjectIfMissing(website.projectName, config.vercelDefaultRegion);
+  const html = renderWebsiteHtml(website);
+  const deployment = await vercel.deployStaticHtml({ projectName: website.projectName, html });
+
+  let domainStatus = null;
+  if (website.domain) {
+    try {
+      await vercel.attachDomain(website.projectName, website.domain);
+    } catch (error) {
+      if (!String(error.message).toLowerCase().includes("already")) {
+        throw error;
+      }
+    }
+    domainStatus = await vercel.getDomainStatus(website.projectName, website.domain);
+  }
+
+  const deploymentUrl = deployment?.url ? `https://${deployment.url}` : null;
+  const liveUrl = website.domain ? `https://${website.domain}` : deploymentUrl;
+
+  const updated = updateWebsite((current) => ({
+    ...current,
+    latestDeploymentId: deployment?.id ?? current?.latestDeploymentId ?? null,
+    latestDeploymentUrl: deploymentUrl,
+    websiteUrl: liveUrl,
+    lastPublishedAt: new Date().toISOString(),
+    domainVerified: Boolean(domainStatus?.verified),
+    status: domainStatus?.verified === false ? "pending_dns" : "published"
+  }));
+
+  return { website: updated, deployment, domainStatus };
 }
 
 const contactSchema = z.object({
@@ -52,59 +168,346 @@ const contactSchema = z.object({
     .describe("2-letter ISO country code like US, GB, NG")
 });
 
-function contactFromResponse(response) {
-  return response?.data ?? response?.contact ?? response ?? null;
-}
-
-async function findDomainByName(domainName) {
-  const normalized = String(domainName).toLowerCase();
-  const result = await ola.listDomains({ perPage: 100, page: 1 });
-  const domains = Array.isArray(result?.data) ? result.data : [];
-  return domains.find((d) => String(d?.domain ?? "").toLowerCase() === normalized) ?? null;
-}
-
 function createMcpServer() {
-  const server = new McpServer({
-    name: "olacv-domains",
-    version: "0.1.0"
-  });
+  const server = new McpServer({ name: "olacv-domains", version: "0.2.0" });
 
+  registerAppTool(
+    server,
+    "create_my_website",
+    {
+      title: "Create my website",
+      description: "Create your personal website. Each user can have one website.",
+      inputSchema: z.object({
+        display_name: z.string().min(2),
+        headline: z.string().optional(),
+        bio: z.string().optional(),
+        sections: z.array(z.string()).optional(),
+        style: z.enum(["classic", "modern", "minimal"]).optional()
+      }),
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      _meta: {
+        "openai/toolInvocation/invoking": "Creating your website...",
+        "openai/toolInvocation/invoked": "Website created."
+      }
+    },
+    async ({ display_name, headline, bio, sections, style }) => {
+      const existing = getWebsite();
+      if (existing) {
+        return {
+          structuredContent: {
+            status: "already_exists",
+            website_url: existing.websiteUrl,
+            domain: existing.domain ?? null
+          },
+          content: toolText("You already have a website. Use update_my_website to change it.")
+        };
+      }
+
+      const projectName = `${config.vercelProjectPrefix}-${slugify(display_name || "website") || "website"}`;
+      const website = updateWebsite(() => ({
+        displayName: display_name,
+        headline: headline ?? "",
+        bio: bio ?? "",
+        sections: sections ?? [],
+        style: style ?? "classic",
+        projectName,
+        latestDeploymentId: null,
+        latestDeploymentUrl: null,
+        websiteUrl: null,
+        domain: null,
+        domainVerified: false,
+        lastPublishedAt: null,
+        status: "created"
+      }));
+
+      return {
+        structuredContent: {
+          status: "created",
+          project_name: projectName,
+          website_url: website.websiteUrl
+        },
+        content: toolText("Your website has been created. Say 'publish my website' to make it live.")
+      };
+    }
+  );
+
+  registerAppTool(
+    server,
+    "update_my_website",
+    {
+      title: "Update my website",
+      description: "Update your personal website content and publish changes.",
+      inputSchema: z.object({
+        headline: z.string().optional(),
+        bio: z.string().optional(),
+        sections: z.array(z.string()).optional(),
+        style: z.enum(["classic", "modern", "minimal"]).optional(),
+        confirm_update: z.boolean()
+      }),
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      _meta: {
+        "openai/toolInvocation/invoking": "Updating your website...",
+        "openai/toolInvocation/invoked": "Website updated."
+      }
+    },
+    async ({ headline, bio, sections, style, confirm_update }) => {
+      if (!confirm_update) {
+        return {
+          structuredContent: { requires_confirmation: true },
+          content: toolText("Update not executed. Confirm update to continue.")
+        };
+      }
+
+      const existing = getWebsite();
+      if (!existing) {
+        throw new Error("No website found. Create one first with create_my_website.");
+      }
+
+      const updated = updateWebsite((current) => ({
+        ...current,
+        headline: headline ?? current.headline,
+        bio: bio ?? current.bio,
+        sections: sections ?? current.sections,
+        style: style ?? current.style,
+        status: "updated"
+      }));
+
+      await publishWebsiteInternal(updated);
+      const current = getWebsite();
+
+      return {
+        structuredContent: {
+          status: "updated",
+          website_url: current.websiteUrl,
+          last_published_at: current.lastPublishedAt
+        },
+        content: toolText(`Website updated and published${current.domain ? ` at ${current.domain}` : ""}.`)
+      };
+    }
+  );
+
+  registerAppTool(
+    server,
+    "publish_my_website",
+    {
+      title: "Publish my website",
+      description: "Publish your website and verify its live status.",
+      inputSchema: z.object({ confirm_publish: z.boolean() }),
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      _meta: {
+        "openai/toolInvocation/invoking": "Publishing your website...",
+        "openai/toolInvocation/invoked": "Website publish complete."
+      }
+    },
+    async ({ confirm_publish }) => {
+      if (!confirm_publish) {
+        return {
+          structuredContent: { requires_confirmation: true },
+          content: toolText("Publish not executed. Confirm publish to continue.")
+        };
+      }
+
+      const existing = getWebsite();
+      if (!existing) {
+        throw new Error("No website found. Create one first with create_my_website.");
+      }
+
+      const { website } = await publishWebsiteInternal(existing);
+      return {
+        structuredContent: {
+          status: website.status,
+          website_url: website.latestDeploymentUrl,
+          domain_url: website.domain ? `https://${website.domain}` : null,
+          message: website.domain && !website.domainVerified ? "Domain linked, waiting for DNS propagation." : "Website is published."
+        },
+        content: toolText(
+          website.domain
+            ? website.domainVerified
+              ? `Your website is live at https://${website.domain}.`
+              : `Website published. Domain ${website.domain} is linked and waiting for DNS propagation.`
+            : `Your website is live at ${website.latestDeploymentUrl}.`
+        )
+      };
+    }
+  );
+
+  registerAppTool(
+    server,
+    "set_my_domain",
+    {
+      title: "Set my domain",
+      description: "Register and connect your .cv domain to your website in one step.",
+      inputSchema: z.object({
+        domain: z.string(),
+        contact: contactSchema,
+        confirm_purchase: z.boolean()
+      }),
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      _meta: {
+        "openai/toolInvocation/invoking": "Setting up your domain...",
+        "openai/toolInvocation/invoked": "Domain setup complete."
+      }
+    },
+    async ({ domain, contact, confirm_purchase }) => {
+      if (!confirm_purchase) {
+        return {
+          structuredContent: { requires_confirmation: true, action: "set_domain", domain },
+          content: toolText("Domain setup not executed. Confirm purchase to continue.")
+        };
+      }
+
+      ensureVercelConfigured();
+      const normalized = normalizeCvDomain(domain);
+      let website = getWebsite();
+      if (!website) {
+        const projectName = `${config.vercelProjectPrefix}-website`;
+        website = updateWebsite(() => ({
+          displayName: contact.name,
+          headline: "",
+          bio: "",
+          sections: [],
+          style: "classic",
+          projectName,
+          latestDeploymentId: null,
+          latestDeploymentUrl: null,
+          websiteUrl: null,
+          domain: null,
+          domainVerified: false,
+          lastPublishedAt: null,
+          status: "created"
+        }));
+      }
+
+      const existingDomain = await findDomainByName(normalized);
+      if (!existingDomain) {
+        const check = await ola.checkDomain(normalized);
+        const available = availabilityFromResponse(check, normalized);
+        if (!available) {
+          throw new Error(`${normalized} is not available and not present in this account.`);
+        }
+
+        const createdContact = await ola.createContact({
+          ...contact,
+          country: contact.country.toUpperCase()
+        });
+        const createdContactId = contactFromResponse(createdContact)?.id;
+        if (!createdContactId) {
+          throw new Error("Failed to create contact for domain registration.");
+        }
+
+        await ola.registerDomain({
+          domain: normalized,
+          years: config.defaultRegistrationYears,
+          registrantContactId: createdContactId,
+          autoRenew: false,
+          nameservers: ["ns1.vercel-dns.com", "ns2.vercel-dns.com"]
+        });
+      }
+
+      website = updateWebsite((current) => ({
+        ...current,
+        domain: normalized,
+        status: "domain_set"
+      }));
+
+      const { website: published, domainStatus } = await publishWebsiteInternal(website);
+      const connected = Boolean(domainStatus?.verified);
+
+      return {
+        structuredContent: {
+          status: connected ? "connected" : "pending",
+          domain: normalized,
+          live_url: `https://${normalized}`,
+          website_url: published.latestDeploymentUrl,
+          message: connected ? "Domain is connected." : "Domain connected, waiting for DNS propagation."
+        },
+        content: toolText(
+          connected
+            ? `Done. Your website is connected to ${normalized}.`
+            : `Domain ${normalized} is connected. It may take a little time to propagate globally.`
+        )
+      };
+    }
+  );
+
+  registerAppTool(
+    server,
+    "my_website_status",
+    {
+      title: "My website status",
+      description: "Check your website/domain live status.",
+      inputSchema: z.object({}),
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+      _meta: {
+        "openai/toolInvocation/invoking": "Checking your website status...",
+        "openai/toolInvocation/invoked": "Status ready."
+      }
+    },
+    async () => {
+      const website = getWebsite();
+      if (!website) {
+        return {
+          structuredContent: {
+            website_exists: false,
+            message: "No website yet."
+          },
+          content: toolText("You don't have a website yet. Say 'create my website' to get started.")
+        };
+      }
+
+      let domainVerified = website.domainVerified;
+      if (website.domain && vercel) {
+        try {
+          const status = await vercel.getDomainStatus(website.projectName, website.domain);
+          domainVerified = Boolean(status?.verified);
+          updateWebsite((current) => ({ ...current, domainVerified }));
+        } catch {
+          // Keep last known status if API is temporarily unavailable.
+        }
+      }
+
+      return {
+        structuredContent: {
+          website_exists: true,
+          website_url: website.latestDeploymentUrl,
+          domain: website.domain,
+          domain_connected: Boolean(website.domain),
+          ssl_ready: Boolean(domainVerified),
+          last_published_at: website.lastPublishedAt,
+          message: website.domain
+            ? domainVerified
+              ? "Website and domain are live."
+              : "Website is live. Domain is connected and propagating."
+            : "Website exists without a custom domain."
+        },
+        content: toolText(
+          website.domain
+            ? domainVerified
+              ? `Your site is live at https://${website.domain}.`
+              : `Your site is published. ${website.domain} is still propagating.`
+            : `Your site is published at ${website.latestDeploymentUrl ?? "(not published yet)"}.`
+        )
+      };
+    }
+  );
+
+  // Internal provider-level tools (kept for backend compatibility, hidden from model).
   registerAppTool(
     server,
     "check_domain",
     {
-      title: "Check .cv domain availability",
-      description:
-        "Use this when the user asks if a .cv domain is available or asks to search .cv names.",
-      inputSchema: z.object({
-        domain: z.string().describe("Domain name with or without .cv (example: johnsmith or johnsmith.cv)")
-      }),
-      annotations: {
-        readOnlyHint: true,
-        openWorldHint: false,
-        destructiveHint: false
-      },
-      _meta: {
-        "openai/toolInvocation/invoking": "Checking domain availability...",
-        "openai/toolInvocation/invoked": "Domain check complete."
-      }
+      title: "Check .cv domain availability (internal)",
+      description: "Internal provider tool.",
+      inputSchema: z.object({ domain: z.string() }),
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+      _meta: { ui: INTERNAL_VISIBILITY.ui }
     },
     async ({ domain }) => {
       const normalized = normalizeCvDomain(domain);
       const result = await ola.checkDomain(normalized);
-      const available = availabilityFromResponse(result, normalized);
-
       return {
-        structuredContent: {
-          domain: normalized,
-          available,
-          raw: result
-        },
-        content: toolText(
-          available
-            ? `${normalized} is available. Ask the user if they want to register it now.`
-            : `${normalized} is not available.`
-        )
+        structuredContent: { domain: normalized, available: availabilityFromResponse(result, normalized), raw: result },
+        content: toolText("OK")
       };
     }
   );
@@ -113,203 +516,32 @@ function createMcpServer() {
     server,
     "register_domain",
     {
-      title: "Register .cv domain",
-      description:
-        "Use this only when the user explicitly confirms purchase. Requires registrant contact id from Ola account.",
+      title: "Register domain (internal)",
+      description: "Internal provider tool.",
       inputSchema: z.object({
-        domain: z.string().describe("Domain to register, with or without .cv"),
-        registrant_contact_id: z
-          .string()
-          .describe("Ola contact id to assign as registrant for this domain"),
-        years: z
-          .number()
-          .int()
-          .min(1)
-          .max(10)
-          .optional()
-          .describe("Registration period in years. Defaults to 1 year."),
-        auto_renew: z.boolean().optional().describe("Enable auto-renew on the domain"),
-        nameservers: z
-          .array(z.string().min(3))
-          .min(2)
-          .max(8)
-          .optional()
-          .describe("Optional nameservers to set during registration"),
-        confirm_purchase: z
-          .boolean()
-          .describe("Must be true only after the user confirms purchase in the current turn")
+        domain: z.string(),
+        registrant_contact_id: z.string(),
+        confirm_purchase: z.boolean(),
+        years: z.number().int().min(1).max(10).optional(),
+        auto_renew: z.boolean().optional(),
+        nameservers: z.array(z.string()).optional()
       }),
-      annotations: {
-        readOnlyHint: false,
-        openWorldHint: false,
-        destructiveHint: false
-      },
-      _meta: {
-        "openai/toolInvocation/invoking": "Registering domain...",
-        "openai/toolInvocation/invoked": "Domain registration complete."
-      }
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      _meta: { ui: INTERNAL_VISIBILITY.ui }
     },
-    async ({ domain, registrant_contact_id, years, auto_renew, nameservers, confirm_purchase }) => {
-      const normalized = normalizeCvDomain(domain);
-
+    async ({ domain, registrant_contact_id, confirm_purchase, years, auto_renew, nameservers }) => {
       if (!confirm_purchase) {
-        return {
-          structuredContent: {
-            requires_confirmation: true,
-            action: "register",
-            domain: normalized
-          },
-          content: toolText(
-            `Registration not executed. Ask: \"Register ${normalized} now?\" and call again with confirm_purchase=true.`
-          )
-        };
+        return { structuredContent: { requires_confirmation: true }, content: toolText("Confirmation required") };
       }
-
+      const normalized = normalizeCvDomain(domain);
       const result = await ola.registerDomain({
         domain: normalized,
-        years: years ?? config.defaultRegistrationYears,
         registrantContactId: registrant_contact_id,
-        autoRenew: auto_renew ?? false,
-        nameservers
-      });
-
-      return {
-        structuredContent: {
-          domain: domainFromResponse(result) ?? normalized,
-          status: "registered",
-          raw: result
-        },
-        content: toolText(`Successfully registered ${normalized}.`)
-      };
-    }
-  );
-
-  registerAppTool(
-    server,
-    "register_domain_with_contact",
-    {
-      title: "Register .cv domain with contact workflow",
-      description:
-        "Use this for end-to-end registration: fetch existing contact or create contact, then register domain after explicit user confirmation.",
-      inputSchema: z.object({
-        domain: z.string().describe("Domain to register, with or without .cv"),
-        years: z
-          .number()
-          .int()
-          .min(1)
-          .max(10)
-          .optional()
-          .describe("Registration period in years. Defaults to 1 year."),
-        auto_renew: z.boolean().optional().describe("Enable auto-renew on the domain"),
-        nameservers: z
-          .array(z.string().min(3))
-          .min(2)
-          .max(8)
-          .optional()
-          .describe("Optional nameservers to set during registration"),
-        existing_contact_id: z
-          .string()
-          .optional()
-          .describe("Use this existing contact id instead of creating a new contact"),
-        contact: contactSchema
-          .optional()
-          .describe("New contact to create when existing_contact_id is not provided"),
-        confirm_purchase: z
-          .boolean()
-          .describe("Must be true only after user confirms purchase in the current turn")
-      }),
-      annotations: {
-        readOnlyHint: false,
-        openWorldHint: false,
-        destructiveHint: false
-      },
-      _meta: {
-        "openai/toolInvocation/invoking": "Creating/fetching contact and registering domain...",
-        "openai/toolInvocation/invoked": "Domain registration workflow complete."
-      }
-    },
-    async ({ domain, years, auto_renew, nameservers, existing_contact_id, contact, confirm_purchase }) => {
-      const normalized = normalizeCvDomain(domain);
-
-      if (!confirm_purchase) {
-        return {
-          structuredContent: {
-            requires_confirmation: true,
-            action: "register_with_contact",
-            domain: normalized
-          },
-          content: toolText(
-            `Registration not executed. Ask: \"Register ${normalized}?\" and call again with confirm_purchase=true.`
-          )
-        };
-      }
-
-      let selectedContactId = existing_contact_id ?? null;
-      let selectedContact = null;
-
-      if (selectedContactId) {
-        const fetched = await ola.fetchContact(selectedContactId);
-        selectedContact = contactFromResponse(fetched);
-      } else if (contact) {
-        const created = await ola.createContact({
-          ...contact,
-          country: contact.country.toUpperCase()
-        });
-        selectedContact = contactFromResponse(created);
-        selectedContactId = selectedContact?.id ?? null;
-      } else {
-        const contactsResult = await ola.listContacts({ perPage: 5, page: 1 });
-        const contacts = Array.isArray(contactsResult?.data) ? contactsResult.data : [];
-
-        if (contacts.length === 1) {
-          selectedContact = contacts[0];
-          selectedContactId = contacts[0].id;
-        } else if (contacts.length > 1) {
-          return {
-            structuredContent: {
-              requires_contact_selection: true,
-              domain: normalized,
-              contacts
-            },
-            content: toolText(
-              "Multiple contacts found. Provide existing_contact_id or pass a contact payload for creation."
-            )
-          };
-        } else {
-          return {
-            structuredContent: {
-              requires_contact_creation: true,
-              domain: normalized
-            },
-            content: toolText(
-              "No contacts found. Provide contact fields so I can create one and register the domain."
-            )
-          };
-        }
-      }
-
-      if (!selectedContactId) {
-        throw new Error("Could not resolve contact id for domain registration.");
-      }
-
-      const result = await ola.registerDomain({
-        domain: normalized,
         years: years ?? config.defaultRegistrationYears,
-        registrantContactId: selectedContactId,
         autoRenew: auto_renew ?? false,
         nameservers
       });
-
-      return {
-        structuredContent: {
-          domain: domainFromResponse(result) ?? normalized,
-          status: "registered",
-          contact_id: selectedContactId,
-          contact: selectedContact,
-          raw: result
-        },
-        content: toolText(`Successfully registered ${normalized} with contact ${selectedContactId}.`)
-      };
+      return { structuredContent: { domain: domainFromResponse(result) ?? normalized, raw: result }, content: toolText("OK") };
     }
   );
 
@@ -317,142 +549,15 @@ function createMcpServer() {
     server,
     "list_domains",
     {
-      title: "List my .cv domains",
-      description: "Use this when the user asks to show, list, or manage their domains.",
-      inputSchema: z.object({
-        per_page: z.number().int().min(1).max(100).optional().describe("Records per page"),
-        page: z.number().int().min(1).optional().describe("Page number")
-      }),
-      annotations: {
-        readOnlyHint: true,
-        openWorldHint: false,
-        destructiveHint: false
-      },
-      _meta: {
-        "openai/toolInvocation/invoking": "Loading your domains...",
-        "openai/toolInvocation/invoked": "Domain list ready."
-      }
+      title: "List domains (internal)",
+      description: "Internal provider tool.",
+      inputSchema: z.object({ per_page: z.number().int().min(1).max(100).optional(), page: z.number().int().min(1).optional() }),
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+      _meta: { ui: INTERNAL_VISIBILITY.ui }
     },
     async ({ per_page, page }) => {
       const result = await ola.listDomains({ perPage: per_page, page });
-      const domains = Array.isArray(result?.domains)
-        ? result.domains
-        : Array.isArray(result)
-          ? result
-          : Array.isArray(result?.data)
-            ? result.data
-            : result?.data?.domains ?? [];
-
-      return {
-        structuredContent: {
-          count: domains.length,
-          domains,
-          meta: result?.meta ?? null,
-          raw: result
-        },
-        content: toolText(domains.length ? `Found ${domains.length} domain(s).` : "No domains found for this account.")
-      };
-    }
-  );
-
-  registerAppTool(
-    server,
-    "create_contact",
-    {
-      title: "Create contact",
-      description: "Create a new Ola contact. Use this before domain registration when no contact exists.",
-      inputSchema: contactSchema,
-      annotations: {
-        readOnlyHint: false,
-        openWorldHint: false,
-        destructiveHint: false
-      },
-      _meta: {
-        "openai/toolInvocation/invoking": "Creating contact...",
-        "openai/toolInvocation/invoked": "Contact created."
-      }
-    },
-    async (input) => {
-      const result = await ola.createContact({
-        ...input,
-        country: input.country.toUpperCase()
-      });
-      const contact = contactFromResponse(result);
-      return {
-        structuredContent: {
-          contact,
-          raw: result
-        },
-        content: toolText(`Contact created successfully with id ${contact?.id ?? "unknown"}.`)
-      };
-    }
-  );
-
-  registerAppTool(
-    server,
-    "list_contacts",
-    {
-      title: "List contacts",
-      description: "Get contacts in your Ola account.",
-      inputSchema: z.object({
-        per_page: z.number().int().min(1).max(100).optional().describe("Records per page"),
-        page: z.number().int().min(1).optional().describe("Page number")
-      }),
-      annotations: {
-        readOnlyHint: true,
-        openWorldHint: false,
-        destructiveHint: false
-      },
-      _meta: {
-        "openai/toolInvocation/invoking": "Loading contacts...",
-        "openai/toolInvocation/invoked": "Contacts loaded."
-      }
-    },
-    async ({ per_page, page }) => {
-      const result = await ola.listContacts({ perPage: per_page, page });
-      const contacts = Array.isArray(result?.data) ? result.data : [];
-
-      return {
-        structuredContent: {
-          count: contacts.length,
-          contacts,
-          meta: result?.meta ?? null,
-          raw: result
-        },
-        content: toolText(contacts.length ? `Found ${contacts.length} contact(s).` : "No contacts found.")
-      };
-    }
-  );
-
-  registerAppTool(
-    server,
-    "fetch_contact",
-    {
-      title: "Fetch contact",
-      description: "Get details for one contact by id.",
-      inputSchema: z.object({
-        id: z.string().describe("Contact id")
-      }),
-      annotations: {
-        readOnlyHint: true,
-        openWorldHint: false,
-        destructiveHint: false
-      },
-      _meta: {
-        "openai/toolInvocation/invoking": "Fetching contact...",
-        "openai/toolInvocation/invoked": "Contact loaded."
-      }
-    },
-    async ({ id }) => {
-      const result = await ola.fetchContact(id);
-      const contact = contactFromResponse(result);
-      return {
-        structuredContent: {
-          contact,
-          raw: result
-        },
-        content: toolText(`Fetched contact ${contact?.id ?? id}.`)
-      };
+      return { structuredContent: { raw: result, domains: result?.data ?? [] }, content: toolText("OK") };
     }
   );
 
@@ -460,65 +565,21 @@ function createMcpServer() {
     server,
     "renew_domain",
     {
-      title: "Renew .cv domain",
-      description: "Use this when the user asks to renew a domain and confirms the renewal.",
-      inputSchema: z.object({
-        domain: z.string().describe("Domain to renew"),
-        years: z
-          .number()
-          .int()
-          .min(1)
-          .max(10)
-          .optional()
-          .describe("Renewal period in years. Defaults to 1 year."),
-        confirm_renewal: z
-          .boolean()
-          .describe("Must be true only after the user confirms renewal in the current turn")
-      }),
-      annotations: {
-        readOnlyHint: false,
-        openWorldHint: false,
-        destructiveHint: false
-      },
-      _meta: {
-        "openai/toolInvocation/invoking": "Renewing domain...",
-        "openai/toolInvocation/invoked": "Domain renewal complete."
-      }
+      title: "Renew domain (internal)",
+      description: "Internal provider tool.",
+      inputSchema: z.object({ domain: z.string(), confirm_renewal: z.boolean(), years: z.number().int().min(1).max(10).optional() }),
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      _meta: { ui: INTERNAL_VISIBILITY.ui }
     },
-    async ({ domain, years, confirm_renewal }) => {
-      const normalized = normalizeCvDomain(domain);
-
+    async ({ domain, confirm_renewal, years }) => {
       if (!confirm_renewal) {
-        return {
-          structuredContent: {
-            requires_confirmation: true,
-            action: "renew",
-            domain: normalized
-          },
-          content: toolText(
-            `Renewal not executed. Ask: \"Renew ${normalized}?\" and call again with confirm_renewal=true.`
-          )
-        };
+        return { structuredContent: { requires_confirmation: true }, content: toolText("Confirmation required") };
       }
-
+      const normalized = normalizeCvDomain(domain);
       const domainRecord = await findDomainByName(normalized);
-      if (!domainRecord?.id) {
-        throw new Error(`Could not find domain id for ${normalized}.`);
-      }
-
-      const result = await ola.renewDomain({
-        domainId: domainRecord.id,
-        years: years ?? config.defaultRenewalYears
-      });
-
-      return {
-        structuredContent: {
-          domain: normalized,
-          status: "renewed",
-          raw: result
-        },
-        content: toolText(`Successfully renewed ${normalized}.`)
-      };
+      if (!domainRecord?.id) throw new Error(`Could not find domain id for ${normalized}.`);
+      const result = await ola.renewDomain({ domainId: domainRecord.id, years: years ?? config.defaultRenewalYears });
+      return { structuredContent: { raw: result }, content: toolText("OK") };
     }
   );
 
@@ -526,62 +587,69 @@ function createMcpServer() {
     server,
     "update_dns",
     {
-      title: "Update domain nameservers",
-      description: "Use this to update nameservers on a .cv domain.",
-      inputSchema: z.object({
-        domain: z.string().describe("Domain to update"),
-        nameservers: z
-          .array(z.string().min(3))
-          .min(2)
-          .max(8)
-          .describe("Nameserver hostnames (example: [ns1.provider.com, ns2.provider.com])"),
-        confirm_dns_update: z
-          .boolean()
-          .describe("Must be true only after the user confirms DNS update in the current turn")
-      }),
-      annotations: {
-        readOnlyHint: false,
-        openWorldHint: false,
-        destructiveHint: false
-      },
-      _meta: {
-        "openai/toolInvocation/invoking": "Updating DNS...",
-        "openai/toolInvocation/invoked": "DNS update complete."
-      }
+      title: "Update dns (internal)",
+      description: "Internal provider tool.",
+      inputSchema: z.object({ domain: z.string(), nameservers: z.array(z.string()).min(2), confirm_dns_update: z.boolean() }),
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      _meta: { ui: INTERNAL_VISIBILITY.ui }
     },
     async ({ domain, nameservers, confirm_dns_update }) => {
-      const normalized = normalizeCvDomain(domain);
-
       if (!confirm_dns_update) {
-        return {
-          structuredContent: {
-            requires_confirmation: true,
-            action: "update_dns",
-            domain: normalized,
-            nameservers
-          },
-          content: toolText(
-            `DNS update not executed. Ask the user to confirm nameservers for ${normalized}, then call with confirm_dns_update=true.`
-          )
-        };
+        return { structuredContent: { requires_confirmation: true }, content: toolText("Confirmation required") };
       }
-
+      const normalized = normalizeCvDomain(domain);
       const domainRecord = await findDomainByName(normalized);
-      if (!domainRecord?.id) {
-        throw new Error(`Could not find domain id for ${normalized}.`);
-      }
-
+      if (!domainRecord?.id) throw new Error(`Could not find domain id for ${normalized}.`);
       const result = await ola.updateDns({ domainId: domainRecord.id, nameservers });
+      return { structuredContent: { raw: result }, content: toolText("OK") };
+    }
+  );
 
-      return {
-        structuredContent: {
-          domain: normalized,
-          nameservers,
-          status: "updated",
-          raw: result
-        },
-        content: toolText(`Updated nameservers for ${normalized}.`)
-      };
+  registerAppTool(
+    server,
+    "create_contact",
+    {
+      title: "Create contact (internal)",
+      description: "Internal provider tool.",
+      inputSchema: contactSchema,
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      _meta: { ui: INTERNAL_VISIBILITY.ui }
+    },
+    async (input) => {
+      const result = await ola.createContact({ ...input, country: input.country.toUpperCase() });
+      return { structuredContent: { contact: contactFromResponse(result), raw: result }, content: toolText("OK") };
+    }
+  );
+
+  registerAppTool(
+    server,
+    "list_contacts",
+    {
+      title: "List contacts (internal)",
+      description: "Internal provider tool.",
+      inputSchema: z.object({ per_page: z.number().int().min(1).max(100).optional(), page: z.number().int().min(1).optional() }),
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+      _meta: { ui: INTERNAL_VISIBILITY.ui }
+    },
+    async ({ per_page, page }) => {
+      const result = await ola.listContacts({ perPage: per_page, page });
+      return { structuredContent: { contacts: result?.data ?? [], raw: result }, content: toolText("OK") };
+    }
+  );
+
+  registerAppTool(
+    server,
+    "fetch_contact",
+    {
+      title: "Fetch contact (internal)",
+      description: "Internal provider tool.",
+      inputSchema: z.object({ id: z.string() }),
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+      _meta: { ui: INTERNAL_VISIBILITY.ui }
+    },
+    async ({ id }) => {
+      const result = await ola.fetchContact(id);
+      return { structuredContent: { contact: contactFromResponse(result), raw: result }, content: toolText("OK") };
     }
   );
 
@@ -612,7 +680,6 @@ async function getOrCreateSession(req) {
     if (transport.sessionId) {
       sessions.delete(transport.sessionId);
     }
-
     await server.close();
   };
 
@@ -657,7 +724,7 @@ app.delete("/mcp", async (req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "olacv-domains", version: "0.1.0" });
+  res.json({ ok: true, service: "olacv-domains", version: "0.2.0" });
 });
 
 app.listen(config.port, () => {
