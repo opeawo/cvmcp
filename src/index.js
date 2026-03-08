@@ -1,5 +1,6 @@
 import express from "express";
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as esbuild from "esbuild";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -21,7 +22,7 @@ const vercel = config.vercelToken
   : null;
 const state = new StateStore(config.stateFilePath);
 
-const USER_ID = "default";
+const requestContext = new AsyncLocalStorage();
 const INTERNAL_VISIBILITY = { ui: { visibility: ["app"] } };
 
 function toolText(text) {
@@ -36,12 +37,32 @@ function slugify(input) {
     .slice(0, 32);
 }
 
+function resolveUserId(req) {
+  const byHeader =
+    req.header("x-chatgpt-user-id") ||
+    req.header("x-user-id") ||
+    req.header("x-forwarded-user");
+  if (byHeader) return byHeader;
+
+  const bodyMetaUserId = req.body?.params?._meta?.["openai/userId"];
+  if (bodyMetaUserId) return String(bodyMetaUserId);
+
+  const sessionId = req.header("mcp-session-id");
+  if (sessionId) return `session:${sessionId}`;
+
+  return "anonymous";
+}
+
+function currentUserId() {
+  return requestContext.getStore()?.userId ?? "anonymous";
+}
+
 function getWebsite() {
-  return state.getUser(USER_ID).website;
+  return state.getUser(currentUserId()).website;
 }
 
 function updateWebsite(updater) {
-  return state.updateUser(USER_ID, (user) => {
+  return state.updateUser(currentUserId(), (user) => {
     user.website = updater(user.website);
     return user;
   }).website;
@@ -900,39 +921,45 @@ async function getOrCreateSession(req) {
 }
 
 app.post("/mcp", async (req, res) => {
-  try {
-    const { transport } = await getOrCreateSession(req);
-    await transport.handleRequest(req, res, req.body);
-  } catch (error) {
-    res.status(500).json({
-      jsonrpc: "2.0",
-      error: {
-        code: -32000,
-        message: error instanceof Error ? error.message : "Internal server error"
-      },
-      id: req.body?.id ?? null
-    });
-  }
+  requestContext.run({ userId: resolveUserId(req) }, async () => {
+    try {
+      const { transport } = await getOrCreateSession(req);
+      await transport.handleRequest(req, res, req.body);
+    } catch (error) {
+      res.status(500).json({
+        jsonrpc: "2.0",
+        error: {
+          code: -32000,
+          message: error instanceof Error ? error.message : "Internal server error"
+        },
+        id: req.body?.id ?? null
+      });
+    }
+  });
 });
 
 app.get("/mcp", async (req, res) => {
-  const sessionId = req.header("mcp-session-id");
-  if (!sessionId || !sessions.has(sessionId)) {
-    res.status(400).send("Invalid or missing mcp-session-id");
-    return;
-  }
+  requestContext.run({ userId: resolveUserId(req) }, async () => {
+    const sessionId = req.header("mcp-session-id");
+    if (!sessionId || !sessions.has(sessionId)) {
+      res.status(400).send("Invalid or missing mcp-session-id");
+      return;
+    }
 
-  await sessions.get(sessionId).transport.handleRequest(req, res);
+    await sessions.get(sessionId).transport.handleRequest(req, res);
+  });
 });
 
 app.delete("/mcp", async (req, res) => {
-  const sessionId = req.header("mcp-session-id");
-  if (!sessionId || !sessions.has(sessionId)) {
-    res.status(400).send("Invalid or missing mcp-session-id");
-    return;
-  }
+  requestContext.run({ userId: resolveUserId(req) }, async () => {
+    const sessionId = req.header("mcp-session-id");
+    if (!sessionId || !sessions.has(sessionId)) {
+      res.status(400).send("Invalid or missing mcp-session-id");
+      return;
+    }
 
-  await sessions.get(sessionId).transport.handleRequest(req, res);
+    await sessions.get(sessionId).transport.handleRequest(req, res);
+  });
 });
 
 app.get("/health", (_req, res) => {
