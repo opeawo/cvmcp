@@ -9,6 +9,8 @@ MCP server for searching and managing `.cv` domains inside ChatGPT using Ola API
 - Combined flow: `register_domain_with_contact` (contact + domain registration in one backend workflow)
 - Simplified website-builder tools:
   - `create_my_website`
+  - `set_website_react_source`
+  - `set_website_html`
   - `update_my_website`
   - `publish_my_website`
   - `set_my_domain`
@@ -74,6 +76,7 @@ Planned for managed website hosting integration:
 - `show my contacts`
 - `register john.cv with this contact ...`
 - `create my website for Opeyemi Awoyemi`
+- `set website react source ...`
 - `publish my website`
 - `set my domain to yourname.cv`
 - `what is my website status`

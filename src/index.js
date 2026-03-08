@@ -1,5 +1,6 @@
 import express from "express";
 import { randomUUID } from "node:crypto";
+import * as esbuild from "esbuild";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -116,6 +117,81 @@ function renderWebsiteHtml(website) {
 </html>`;
 }
 
+function rewriteBareImportsForBrowser(code) {
+  return code
+    .replace(/from\s+["']([^"'./][^"']*)["']/g, (_match, specifier) => {
+      if (specifier.startsWith("http://") || specifier.startsWith("https://")) {
+        return `from "${specifier}"`;
+      }
+      return `from "https://esm.sh/${specifier}"`;
+    })
+    .replace(/import\(\s*["']([^"'./][^"']*)["']\s*\)/g, (_match, specifier) => {
+      if (specifier.startsWith("http://") || specifier.startsWith("https://")) {
+        return `import("${specifier}")`;
+      }
+      return `import("https://esm.sh/${specifier}")`;
+    });
+}
+
+function extractDefaultComponentName(source) {
+  const match = source.match(/export\s+default\s+function\s+([A-Za-z_$][\w$]*)\s*\(/);
+  if (match?.[1]) return match[1];
+
+  const exprMatch = source.match(/export\s+default\s+([A-Za-z_$][\w$]*)\s*;/);
+  if (exprMatch?.[1]) return exprMatch[1];
+
+  return "App";
+}
+
+async function renderReactSourceToHtml({ source, title = "My Website" }) {
+  const rewritten = rewriteBareImportsForBrowser(source);
+  const componentName = extractDefaultComponentName(source);
+
+  const entry = `
+import React from "https://esm.sh/react@18";
+import { createRoot } from "https://esm.sh/react-dom@18/client";
+${rewritten}
+
+const __Component =
+  typeof ${componentName} !== "undefined"
+    ? ${componentName}
+    : (typeof App !== "undefined" ? App : null);
+
+if (!__Component) {
+  throw new Error("Could not locate default React component export.");
+}
+
+const __root = createRoot(document.getElementById("root"));
+__root.render(React.createElement(__Component));
+`;
+
+  let transpiled;
+  try {
+    transpiled = await esbuild.transform(entry, {
+      loader: "jsx",
+      format: "esm",
+      target: "es2020"
+    });
+  } catch (error) {
+    throw new Error(`React source compilation failed: ${error.message}`);
+  }
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>${String(title).replace(/</g, "&lt;")}</title>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module">
+${transpiled.code}
+  </script>
+</body>
+</html>`;
+}
+
 async function resolveWebsiteHtml({ html, website_file }) {
   if (typeof html === "string" && html.trim()) {
     return html;
@@ -137,7 +213,15 @@ async function publishWebsiteInternal(website) {
   ensureVercelConfigured();
 
   await vercel.createProjectIfMissing(website.projectName, config.vercelDefaultRegion);
-  const html = website?.htmlSource ? website.htmlSource : renderWebsiteHtml(website);
+  let html = renderWebsiteHtml(website);
+  if (website?.sourceMode === "html" && website?.htmlSource) {
+    html = website.htmlSource;
+  } else if (website?.sourceMode === "react" && website?.reactSource) {
+    html = await renderReactSourceToHtml({
+      source: website.reactSource,
+      title: website.displayName || "My Website"
+    });
+  }
   const deployment = await vercel.deployStaticHtml({ projectName: website.projectName, html });
 
   let domainStatus = null;
@@ -227,7 +311,9 @@ function createMcpServer() {
         bio: bio ?? "",
         sections: sections ?? [],
         style: style ?? "classic",
+        sourceMode: "generated",
         htmlSource: null,
+        reactSource: null,
         projectName,
         latestDeploymentId: null,
         latestDeploymentUrl: null,
@@ -243,9 +329,56 @@ function createMcpServer() {
           status: "created",
           project_name: projectName,
           website_url: website.websiteUrl,
+          source_mode: "generated",
           has_uploaded_html: false
         },
         content: toolText("Your website has been created. Upload or paste HTML with set_website_html, then publish.")
+      };
+    }
+  );
+
+  registerAppTool(
+    server,
+    "set_website_react_source",
+    {
+      title: "Set website React source",
+      description: "Paste React JSX source code for your website component and use it for publishing.",
+      inputSchema: z.object({
+        component_jsx: z.string().min(10).describe("React component source code (.jsx)"),
+        title: z.string().optional().describe("Optional browser page title override")
+      }),
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      _meta: {
+        "openai/toolInvocation/invoking": "Saving React source...",
+        "openai/toolInvocation/invoked": "React source saved."
+      }
+    },
+    async ({ component_jsx, title }) => {
+      const existing = getWebsite();
+      if (!existing) {
+        throw new Error("No website found. Create one first with create_my_website.");
+      }
+
+      if (component_jsx.length > 700_000) {
+        throw new Error("React source is too large. Keep it under 700KB.");
+      }
+
+      updateWebsite((current) => ({
+        ...current,
+        sourceMode: "react",
+        reactSource: component_jsx,
+        htmlSource: null,
+        displayName: title ?? current.displayName,
+        status: "react_source_set"
+      }));
+
+      return {
+        structuredContent: {
+          status: "saved",
+          source_mode: "react",
+          bytes: component_jsx.length
+        },
+        content: toolText("React source saved. Say 'publish my website' to compile and deploy it.")
       };
     }
   );
@@ -286,7 +419,9 @@ function createMcpServer() {
 
       updateWebsite((current) => ({
         ...current,
+        sourceMode: "html",
         htmlSource: resolved,
+        reactSource: null,
         status: "html_set"
       }));
 
@@ -388,6 +523,7 @@ function createMcpServer() {
           status: website.status,
           website_url: website.latestDeploymentUrl,
           domain_url: website.domain ? `https://${website.domain}` : null,
+          source_mode: website.sourceMode ?? "generated",
           has_uploaded_html: Boolean(website.htmlSource),
           message: website.domain && !website.domainVerified ? "Domain linked, waiting for DNS propagation." : "Website is published."
         },
@@ -438,7 +574,9 @@ function createMcpServer() {
           bio: "",
           sections: [],
           style: "classic",
+          sourceMode: "generated",
           htmlSource: null,
+          reactSource: null,
           projectName,
           latestDeploymentId: null,
           latestDeploymentUrl: null,
@@ -543,6 +681,7 @@ function createMcpServer() {
           website_exists: true,
           website_url: website.latestDeploymentUrl,
           domain: website.domain,
+          source_mode: website.sourceMode ?? "generated",
           has_uploaded_html: Boolean(website.htmlSource),
           domain_connected: Boolean(website.domain),
           ssl_ready: Boolean(domainVerified),
