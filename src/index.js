@@ -116,11 +116,28 @@ function renderWebsiteHtml(website) {
 </html>`;
 }
 
+async function resolveWebsiteHtml({ html, website_file }) {
+  if (typeof html === "string" && html.trim()) {
+    return html;
+  }
+
+  if (website_file?.download_url) {
+    const response = await fetch(website_file.download_url);
+    if (!response.ok) {
+      throw new Error(`Failed to download uploaded file (${response.status}).`);
+    }
+    const text = await response.text();
+    return text;
+  }
+
+  throw new Error("Provide html content or an uploaded website_file.");
+}
+
 async function publishWebsiteInternal(website) {
   ensureVercelConfigured();
 
   await vercel.createProjectIfMissing(website.projectName, config.vercelDefaultRegion);
-  const html = renderWebsiteHtml(website);
+  const html = website?.htmlSource ? website.htmlSource : renderWebsiteHtml(website);
   const deployment = await vercel.deployStaticHtml({ projectName: website.projectName, html });
 
   let domainStatus = null;
@@ -210,6 +227,7 @@ function createMcpServer() {
         bio: bio ?? "",
         sections: sections ?? [],
         style: style ?? "classic",
+        htmlSource: null,
         projectName,
         latestDeploymentId: null,
         latestDeploymentUrl: null,
@@ -224,9 +242,60 @@ function createMcpServer() {
         structuredContent: {
           status: "created",
           project_name: projectName,
-          website_url: website.websiteUrl
+          website_url: website.websiteUrl,
+          has_uploaded_html: false
         },
-        content: toolText("Your website has been created. Say 'publish my website' to make it live.")
+        content: toolText("Your website has been created. Upload or paste HTML with set_website_html, then publish.")
+      };
+    }
+  );
+
+  registerAppTool(
+    server,
+    "set_website_html",
+    {
+      title: "Set website HTML",
+      description: "Upload or paste the HTML you want deployed for your website.",
+      inputSchema: z.object({
+        html: z.string().optional().describe("Raw HTML for the website"),
+        website_file: z
+          .object({
+            download_url: z.string(),
+            file_id: z.string().optional()
+          })
+          .optional()
+          .describe("Uploaded HTML file object")
+      }),
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      _meta: {
+        "openai/toolInvocation/invoking": "Saving your website HTML...",
+        "openai/toolInvocation/invoked": "Website HTML saved.",
+        "openai/fileParams": ["website_file"]
+      }
+    },
+    async ({ html, website_file }) => {
+      const existing = getWebsite();
+      if (!existing) {
+        throw new Error("No website found. Create one first with create_my_website.");
+      }
+
+      const resolved = await resolveWebsiteHtml({ html, website_file });
+      if (resolved.length > 500_000) {
+        throw new Error("HTML file is too large. Keep it under 500KB.");
+      }
+
+      updateWebsite((current) => ({
+        ...current,
+        htmlSource: resolved,
+        status: "html_set"
+      }));
+
+      return {
+        structuredContent: {
+          status: "saved",
+          bytes: resolved.length
+        },
+        content: toolText("Website HTML saved. Say 'publish my website' when ready.")
       };
     }
   );
@@ -269,6 +338,7 @@ function createMcpServer() {
         bio: bio ?? current.bio,
         sections: sections ?? current.sections,
         style: style ?? current.style,
+        htmlSource: current.htmlSource ?? null,
         status: "updated"
       }));
 
@@ -318,6 +388,7 @@ function createMcpServer() {
           status: website.status,
           website_url: website.latestDeploymentUrl,
           domain_url: website.domain ? `https://${website.domain}` : null,
+          has_uploaded_html: Boolean(website.htmlSource),
           message: website.domain && !website.domainVerified ? "Domain linked, waiting for DNS propagation." : "Website is published."
         },
         content: toolText(
@@ -367,6 +438,7 @@ function createMcpServer() {
           bio: "",
           sections: [],
           style: "classic",
+          htmlSource: null,
           projectName,
           latestDeploymentId: null,
           latestDeploymentUrl: null,
@@ -471,6 +543,7 @@ function createMcpServer() {
           website_exists: true,
           website_url: website.latestDeploymentUrl,
           domain: website.domain,
+          has_uploaded_html: Boolean(website.htmlSource),
           domain_connected: Boolean(website.domain),
           ssl_ready: Boolean(domainVerified),
           last_published_at: website.lastPublishedAt,
