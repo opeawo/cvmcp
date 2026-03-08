@@ -1,0 +1,61 @@
+# .cv Domains ChatGPT App (MCP)
+
+MCP server for searching and managing `.cv` domains inside ChatGPT using Ola API.
+
+## Implemented scope
+- P0 flow: `check_domain` -> `register_domain`
+- P1 management tools: `list_domains`, `renew_domain`, `update_dns`
+
+## API assumptions
+Using Ola endpoints from your PRD:
+- `POST /api/v1/domains/check`
+- `POST /api/v1/domains/register`
+- `GET /api/v1/domains`
+- `POST /api/v1/domains/{domain}/renew`
+- `POST /api/v1/domains/{domain}`
+
+Auth header:
+- `Authorization: Bearer <OLA_API_TOKEN>` (prefix configurable via `OLA_AUTH_PREFIX`)
+
+## Setup
+1. Install dependencies:
+```bash
+npm install
+```
+
+2. Configure env:
+```bash
+cp .env.example .env
+```
+
+3. Start server:
+```bash
+npm start
+```
+
+Server endpoints:
+- MCP endpoint: `http://localhost:8787/mcp`
+- Health: `http://localhost:8787/health`
+
+## Add to ChatGPT Developer Mode
+1. Enable Developer Mode in ChatGPT (Settings -> Apps -> Advanced settings -> Developer mode).
+2. Expose local server via HTTPS tunnel (for example `ngrok http 8787`).
+3. Create App from MCP URL: `https://<your-tunnel>/mcp`.
+4. Test prompts:
+- `is john.cv available`
+- `register john.cv`
+- `show my domains`
+- `renew john.cv`
+
+## P0 conversation behavior
+Expected interaction:
+1. User: `Is john.cv available?`
+2. App calls `check_domain`
+3. Assistant asks: `Register john.cv for $12/year?`
+4. User confirms
+5. App calls `register_domain` with `confirm_purchase=true`
+
+## Notes
+- Write tools include MCP annotations for confirmation-oriented UX.
+- Tool handlers also enforce explicit confirmation booleans (`confirm_purchase`, `confirm_renewal`, `confirm_dns_update`).
+- Domain input is normalized to `.cv`.

@@ -1,0 +1,21 @@
+{
+  "name": "cvmcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ChatGPT App MCP server for .cv domains via Ola API",
+  "scripts": {
+    "start": "node src/index.js",
+    "check": "node --check src/index.js && node --check src/ola-client.js && node --check src/config.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "^1.2.0",
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "dotenv": "^16.6.1",
+    "express": "^5.1.0",
+    "zod": "^4.1.5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
