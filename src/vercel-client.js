@@ -96,6 +96,27 @@ export class VercelClient {
     });
   }
 
+  async listProjects() {
+    const result = await this.request("/v9/projects", {
+      method: "GET",
+      query: { limit: 100 }
+    });
+    return Array.isArray(result?.projects) ? result.projects : [];
+  }
+
+  async listProjectDomains(projectName) {
+    const result = await this.request(`/v10/projects/${encodeURIComponent(projectName)}/domains`, {
+      method: "GET"
+    });
+    return Array.isArray(result?.domains) ? result.domains : [];
+  }
+
+  async removeDomain(projectName, domain) {
+    return this.request(`/v10/projects/${encodeURIComponent(projectName)}/domains/${encodeURIComponent(domain)}`, {
+      method: "DELETE"
+    });
+  }
+
   async getDomainStatus(projectName, domain) {
     return this.request(`/v10/projects/${encodeURIComponent(projectName)}/domains/${encodeURIComponent(domain)}`, {
       method: "GET"

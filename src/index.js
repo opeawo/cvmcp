@@ -285,14 +285,46 @@ async function publishWebsiteInternal(website) {
 
   let domainStatus = null;
   if (website.domain) {
+    const domain = website.domain;
     try {
-      await vercel.attachDomain(projectName, website.domain);
+      await vercel.attachDomain(projectName, domain);
     } catch (error) {
-      if (!String(error.message).toLowerCase().includes("already")) {
+      const msg = String(error.message).toLowerCase();
+      const transferable =
+        msg.includes("already") ||
+        msg.includes("in use") ||
+        msg.includes("another project") ||
+        msg.includes("assigned");
+
+      if (!transferable) {
         throw error;
       }
+
+      const projects = await vercel.listProjects();
+      for (const p of projects) {
+        if (!p?.name || p.name === projectName) continue;
+        try {
+          const domains = await vercel.listProjectDomains(p.name);
+          if (domains.some((d) => String(d?.name).toLowerCase() === String(domain).toLowerCase())) {
+            await vercel.removeDomain(p.name, domain);
+          }
+        } catch {
+          // Ignore unrelated project/domain errors during transfer scan.
+        }
+      }
+
+      await vercel.attachDomain(projectName, domain);
     }
-    domainStatus = await vercel.getDomainStatus(projectName, website.domain);
+
+    try {
+      domainStatus = await vercel.getDomainStatus(projectName, domain);
+    } catch (error) {
+      const msg = String(error.message).toLowerCase();
+      if (!msg.includes("not found")) {
+        throw error;
+      }
+      domainStatus = { verified: false };
+    }
   }
 
   const deploymentUrl = deployment?.url ? `https://${deployment.url}` : `https://${projectName}.vercel.app`;
