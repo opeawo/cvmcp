@@ -49,15 +49,30 @@ export class OlaClient {
     });
   }
 
-  async registerDomain({ domain, years, registrantContactId, autoRenew }) {
-    return this.request("/api/v1/domains/register", {
+  async registerDomain({ domain, years, registrantContactId, autoRenew, nameservers }) {
+    const body = {
+      name: domain,
+      registrant: registrantContactId,
+      admin: registrantContactId,
+      tech: registrantContactId,
+      billing: registrantContactId
+    };
+
+    if (typeof years === "number") {
+      body.period = years;
+    }
+
+    if (typeof autoRenew === "boolean") {
+      body.auto_renew = autoRenew;
+    }
+
+    if (Array.isArray(nameservers) && nameservers.length > 0) {
+      body.nameservers = nameservers;
+    }
+
+    return this.request("/api/v1/domains", {
       method: "POST",
-      body: {
-        domain,
-        period: years,
-        owner_contact_ref: registrantContactId,
-        auto_renewal: autoRenew
-      }
+      body
     });
   }
 
@@ -69,15 +84,15 @@ export class OlaClient {
     return this.request(`/api/v1/domains${suffix}`, { method: "GET" });
   }
 
-  async renewDomain({ domain, years }) {
-    return this.request(`/api/v1/domains/${encodeURIComponent(domain)}/renew`, {
+  async renewDomain({ domainId, years }) {
+    return this.request(`/api/v1/domains/${encodeURIComponent(domainId)}/renew`, {
       method: "POST",
       body: { period: years }
     });
   }
 
-  async updateDns({ domain, nameservers }) {
-    return this.request(`/api/v1/domains/${encodeURIComponent(domain)}`, {
+  async updateDns({ domainId, nameservers }) {
+    return this.request(`/api/v1/domains/${encodeURIComponent(domainId)}`, {
       method: "POST",
       body: {
         nameservers

@@ -56,6 +56,13 @@ function contactFromResponse(response) {
   return response?.data ?? response?.contact ?? response ?? null;
 }
 
+async function findDomainByName(domainName) {
+  const normalized = String(domainName).toLowerCase();
+  const result = await ola.listDomains({ perPage: 100, page: 1 });
+  const domains = Array.isArray(result?.data) ? result.data : [];
+  return domains.find((d) => String(d?.domain ?? "").toLowerCase() === normalized) ?? null;
+}
+
 function createMcpServer() {
   const server = new McpServer({
     name: "olacv-domains",
@@ -122,6 +129,12 @@ function createMcpServer() {
           .optional()
           .describe("Registration period in years. Defaults to 1 year."),
         auto_renew: z.boolean().optional().describe("Enable auto-renew on the domain"),
+        nameservers: z
+          .array(z.string().min(3))
+          .min(2)
+          .max(8)
+          .optional()
+          .describe("Optional nameservers to set during registration"),
         confirm_purchase: z
           .boolean()
           .describe("Must be true only after the user confirms purchase in the current turn")
@@ -136,7 +149,7 @@ function createMcpServer() {
         "openai/toolInvocation/invoked": "Domain registration complete."
       }
     },
-    async ({ domain, registrant_contact_id, years, auto_renew, confirm_purchase }) => {
+    async ({ domain, registrant_contact_id, years, auto_renew, nameservers, confirm_purchase }) => {
       const normalized = normalizeCvDomain(domain);
 
       if (!confirm_purchase) {
@@ -156,7 +169,8 @@ function createMcpServer() {
         domain: normalized,
         years: years ?? config.defaultRegistrationYears,
         registrantContactId: registrant_contact_id,
-        autoRenew: auto_renew ?? false
+        autoRenew: auto_renew ?? false,
+        nameservers
       });
 
       return {
@@ -187,6 +201,12 @@ function createMcpServer() {
           .optional()
           .describe("Registration period in years. Defaults to 1 year."),
         auto_renew: z.boolean().optional().describe("Enable auto-renew on the domain"),
+        nameservers: z
+          .array(z.string().min(3))
+          .min(2)
+          .max(8)
+          .optional()
+          .describe("Optional nameservers to set during registration"),
         existing_contact_id: z
           .string()
           .optional()
@@ -208,7 +228,7 @@ function createMcpServer() {
         "openai/toolInvocation/invoked": "Domain registration workflow complete."
       }
     },
-    async ({ domain, years, auto_renew, existing_contact_id, contact, confirm_purchase }) => {
+    async ({ domain, years, auto_renew, nameservers, existing_contact_id, contact, confirm_purchase }) => {
       const normalized = normalizeCvDomain(domain);
 
       if (!confirm_purchase) {
@@ -276,7 +296,8 @@ function createMcpServer() {
         domain: normalized,
         years: years ?? config.defaultRegistrationYears,
         registrantContactId: selectedContactId,
-        autoRenew: auto_renew ?? false
+        autoRenew: auto_renew ?? false,
+        nameservers
       });
 
       return {
@@ -480,8 +501,13 @@ function createMcpServer() {
         };
       }
 
+      const domainRecord = await findDomainByName(normalized);
+      if (!domainRecord?.id) {
+        throw new Error(`Could not find domain id for ${normalized}.`);
+      }
+
       const result = await ola.renewDomain({
-        domain: normalized,
+        domainId: domainRecord.id,
         years: years ?? config.defaultRenewalYears
       });
 
@@ -540,7 +566,12 @@ function createMcpServer() {
         };
       }
 
-      const result = await ola.updateDns({ domain: normalized, nameservers });
+      const domainRecord = await findDomainByName(normalized);
+      if (!domainRecord?.id) {
+        throw new Error(`Could not find domain id for ${normalized}.`);
+      }
+
+      const result = await ola.updateDns({ domainId: domainRecord.id, nameservers });
 
       return {
         structuredContent: {
